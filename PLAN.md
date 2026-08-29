@@ -4,10 +4,15 @@ Self-hosted PaaS for **plain Linux servers**. Docker as the runtime, no Kubernet
 control-plane-per-cluster tax. One static Go binary for the control plane, one for the
 node agent, one for the edge proxy, one CLI.
 
-This is a sibling to `vesta-kubernetes`, not a replacement. Same product surface (projects,
-apps, environments, secrets, deploys), different substrate: `vesta-kubernetes` reconciles
-CRDs into Deployments; this reconciles a desired-state spec into Docker containers on a
-fleet of ordinary VPS boxes.
+**This is Vesta.** The name belongs to this project — the Docker/Linux edition is the
+product. `vesta-kubernetes` is the sibling edition for teams that already run a cluster:
+same product surface (projects, apps, environments, secrets, deploys), different substrate.
+`vesta-kubernetes` reconciles CRDs into Deployments; Vesta reconciles a desired-state spec
+into Docker containers on a fleet of ordinary VPS boxes. Shared vocabulary, shared UI
+language, shared CLI verbs — a team can move between the two without relearning the model.
+
+The earlier Rust-agent prototype that held this name now lives in `vesta-old/` and is
+retired (§9).
 
 ---
 
@@ -93,8 +98,8 @@ box or spread across a fleet.
 
 ## 3. Language: Go, decided
 
-The prototype in `vesta/` is a Rust agent behind a NestJS API. That combination is being
-retired. Everything becomes Go.
+The prototype in `vesta-old/` is a Rust agent behind a NestJS API. That combination is
+being retired. Everything becomes Go.
 
 **Why Go wins here specifically:**
 
@@ -389,7 +394,7 @@ notifications, webhooks (HMAC-signed), audit, resource limits, team quotas, temp
 ## 8. Repo layout
 
 ```
-vesta-new/
+vesta/
 ├── cmd/
 │   ├── vestad/          control plane (API + UI + scheduler + store)
 │   ├── vesta-agent/     node agent
@@ -434,15 +439,15 @@ layers above the runtime, with the k8s reconciler swapped for a Docker one.
 | `ui/` | Port. Add fleet view, replica view, environment diff, rollout progress. |
 | `cli/` | Port. Add `server`, `scale`, `promote`, `secret reveal`. |
 
-| From `vesta/` (Rust prototype) | Action |
+| From `vesta-old/` (Rust prototype) | Action |
 |---|---|
 | `apps/agent/src/{docker,proxy,secrets,health,builds,system,logs,exec,maintenance,backups,cron}` | Reimplement as Go packages. The module decomposition was right; the language wasn't. |
 | `packages/db/src/entities/*` (30 TypeORM entities) | Translate to the sqlc schema. This is the fastest path to a complete data model. |
 | `claude.md` security principles + secret ACL model | Carry forward wholesale. |
 | NestJS API, Next.js web, BullMQ/Redis | **Retire.** |
 
-Archive `vesta/` as `vesta-legacy-rust/` rather than deleting — the entity definitions and
-the spec are worth grepping for a while.
+`vesta-old/` is kept rather than deleted — the entity definitions and the spec are worth
+grepping for a while. Nothing in it ships.
 
 ---
 
@@ -534,5 +539,10 @@ Vesta projects/apps/environments.
 4. **Single-binary control plane vs. containerized.** Shipping `vestad` as a systemd unit
    is faster and lighter; shipping it as a container is what everyone expects. Probably
    both, with systemd as the documented default.
-5. **Naming.** `vesta-new` is a working title. Given `vesta-kubernetes` exists, this is
-   plausibly just `vesta` (the Docker/Linux edition) with the k8s product as the sibling.
+5. **Two editions, one name.** Naming is settled — this is Vesta, `vesta-kubernetes` is the
+   Kubernetes edition — but the consequences are not. Open: does the Go module path become
+   `getvesta.sh/vesta` (with the existing `kubernetes.getvesta.sh/*` left alone), do the two
+   editions share a version number and release cadence or drift independently, and does the
+   CLI stay a single `vesta` binary that detects its backend or ship as two? Recommendation:
+   independent versions, one CLI with a `--context` that points at either control plane,
+   since the verbs are identical by design.
