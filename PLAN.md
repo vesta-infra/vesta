@@ -121,6 +121,9 @@ you rotate." See §6.1 (T4) for how this sits in the full threat model.
   grants standing root access to anything.
 - Managed databases, backups, cron, one-shot jobs, logs, exec — parity with Coolify's
   useful surface.
+- Configuration as a reviewable file in the app's own repo (`vesta.yaml`), so config and the
+  code depending on it change, review, and roll back together — without forcing it on anyone
+  who prefers the UI.
 - Single binary per component. `curl | sh` install. No Redis, no queue broker, no PHP.
 
 **Non-goals**
@@ -547,32 +550,63 @@ single server, then a redeploy under continuous `hey` load with **zero** failed 
 Envelope encryption, KMS + sealed mode, per-agent sealing, `vesta-init` tmpfs handoff,
 socket handoff, ACLs, reveal audit, log redaction, versioning and rotation. Acceptance:
 deploy an app with 20 secrets; `docker inspect`, the on-disk container config, and a full
-DB dump each yield zero plaintext; the app reads them from `process.env` unchanged.
+DB dump each yield zero plaintext; the app reads them from `process.env` unchanged. Scoped and
+shared secrets land here too (ARCHITECTURE §11.6) — org/project/environment/app scope, the
+same three types and three injection modes as the Kubernetes edition, and a rotation dialog
+that names its blast radius before it rolls anything.
 
 **M4 — Environments (week 9–10)**
 Overlays, inheritance, diff UI, promote-by-digest, approval gates, preview environments
 with TTL. Acceptance: one app, three environments, promote staging→prod moves the digest
 and nothing else.
 
+**M4.5 — Identity (week 10–11)**
+OIDC SSO with group→role mapping and JIT provisioning, MFA, scoped API tokens, CI service
+accounts, and a mandatory break-glass local admin (ARCHITECTURE §17). Placed before the
+build milestone because CI needs scoped tokens to deploy, and retrofitting auth after teams
+exist is worse than doing it here.
+
 **M5 — Builds and git (week 11–13)**
 BuildKit integration with cache export, Dockerfile/Nixpacks/buildpack strategies, GitHub
-App + GitLab/Gitea webhooks, push-to-deploy, build logs streaming, deploy hooks.
-Acceptance: push to `main` → live in under 90 seconds warm.
+App + GitLab/Gitea webhooks, push-to-deploy, build logs streaming, deploy hooks, and the
+registry pull-through cache / private registry (§12.1). Also **`vesta.yaml`** (§18.1) —
+read from the deployed commit, with field-level ownership and expiring UI overrides — which
+lands here because it only means anything once config can be read from a git commit.
+Acceptance: push to `main` → live in under 90 seconds warm; a five-node fleet pulls a new
+image from the local cache rather than five times from upstream; and `vesta export` round-trips
+an app through a committed `vesta.yaml` with no config change.
 
 **M6 — Services and operations (week 14–16)**
 Managed Postgres/MySQL/Redis/Mongo, service links with template injection, encrypted
-backups to S3-compatible storage with restore drills, cron and one-shot jobs, resource
-limits, quotas, notifications, maintenance mode. Job semantics are specified in
+backups to S3-compatible storage, **automated restore drills** that provision a scratch
+environment, restore, verify, and record the measured RTO (ARCHITECTURE §16.3), volume tiers
+(§16.1), managed-database **major-version upgrades** run as a job with extension pre-flight
+and a retained old data directory for rollback (§15.2), connection pooling, cron and one-shot
+jobs, resource
+limits, quotas, notifications, maintenance mode, and **log drains** to OTLP, Loki, syslog,
+S3, or HTTP (ARCHITECTURE §20.6) — shipped from the agent so they keep working during a
+control-plane outage, with redaction applied before a line ever leaves the node, and a
+`Reliable` class that buffers through a sink outage without ever blocking the container.
+Job semantics are specified in
 ARCHITECTURE §13: agent-side timers so schedules keep firing while the control plane is
 down, at-most-once per window, mandatory timezones, and dead-man alerting for jobs that
 stop firing.
 
-**M7 — Fleet and polish (week 17–19)**
+**M6.5 — Scaling (week 16–17)**
+Autoscaling on proxy-measured concurrency, and scale-to-zero with wake-on-request
+(ARCHITECTURE §14). Acceptance: an idle preview environment parks itself, and the next
+request wakes it and is served — not 503'd — with the cold-start time reported. Scale-to-zero
+ships disabled for production environments.
+
+**M7 — Fleet and polish (week 17–20)**
 Multi-server placement and constraints, spread/binpack, proxy mesh and internal DNS
-resolver, fleet dashboard, metrics, OTLP, audit UI, `install.sh`, docs, migration importer
+resolver, network zones for VPC vs public-only fleets (§10.6), fleet dashboard, proxy RED
+metrics (§20.9), service topology map (§20.10), cost allocation with idle-waste reporting
+(§20.11), Docker Compose import with secret detection (§18.2), `vesta export` (§18.3), OTLP,
+audit UI, `install.sh`, docs, migration importer
 that reads a Coolify install and produces Vesta projects/apps/environments.
 
-Also **signed releases and agent auto-update** (ARCHITECTURE §17). This moved forward from
+Also **signed releases and agent auto-update** (ARCHITECTURE §23). This moved forward from
 post-v1: the moment a fleet exists, hand-updating every node is untenable, and the frozen
 update channel has to be in the protocol from the first release that ships to anyone —
 retrofitting a recovery path into an already-deployed fleet means SSH-ing to every box,
@@ -610,15 +644,19 @@ canary node and watch it revert itself and halt the rollout, with zero container
 
 ## 12. Open questions
 
-1. **Volume portability.** Node failover is meaningless without it. Do we require external
-   storage (NFS/S3-backed) for failover-eligible stateful apps, or ship replicated volumes?
-   Blocks the post-v1 failover work; does not block v1.
+1. ~~**Volume portability.**~~ **Resolved** (ARCHITECTURE §16.1). We do not build
+   distributed storage. Volumes declare a tier — Local (default), Replicated, or Shared —
+   and failover eligibility follows from the tier rather than being a fleet-wide unknown.
+   Stateless apps, which are most of them, were never constrained by this. What remains open
+   is narrower: which filesystems we support for Replicated send/receive beyond ZFS and
+   btrfs, and whether snapshot-plus-rsync is good enough as the fallback.
 2. **Sealed mode ergonomics.** Requiring an unseal after every control-plane restart will
    annoy solo operators into disabling it. Is auto-unseal via a cloud KMS the real default,
    with Shamir as the paranoid option?
-3. **Coolify importer fidelity.** Read-only import of apps and domains is achievable.
-   Importing their secrets means asking users to paste plaintext once — is that acceptable
-   as a one-time migration, with an immediate forced rotation prompt?
+3. **Coolify importer fidelity.** Read-only import of apps and domains is achievable, and
+   shares the preview-and-diff pipeline with Compose import (ARCHITECTURE §18.2). Still
+   open: importing their secrets means asking users to paste plaintext once — acceptable as
+   a one-time migration with an immediate forced-rotation prompt, or not at all?
 4. **Single-binary control plane vs. containerized.** Shipping `vestad` as a systemd unit
    is faster and lighter; shipping it as a container is what everyone expects. Probably
    both, with systemd as the documented default.
