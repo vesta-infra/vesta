@@ -278,6 +278,17 @@ vesta-proxy :443 ──┬─▶ 172.20.0.11:3000   app_prod_1   healthy
 Scaling is `replicas: 4` on the environment. The agent creates or removes containers to
 match, the proxy pool updates on the same reconcile pass.
 
+**This extends to non-HTTP services too.** Apps that must answer on a real port — Postgres
+on 5432, SMTP on 25, MQTT, a game server — get a registered `PortBinding` where
+`vesta-proxy` owns the host port and load-balances behind it (ARCHITECTURE §7.4). So a
+bound TCP port keeps replicas *and* gets zero-downtime deploys, because the listener never
+moves. Docker's own `-p` publishing, which pins one container to one port, remains
+available as an explicit Direct mode for the cases that need a preserved source IP. Bindings
+are tracked in a registry: port conflicts are a validation error when you save, naming the
+app that already holds the port, rather than a container that fails to start at 2 a.m. And
+they bind the private interface by default — exposing a database to `0.0.0.0` is a decision
+you make on purpose, with a warning, not a default you discover from a scanner.
+
 ### 5.2 Stateless vs stateful
 
 Replicas > 1 requires the app to be marked stateless, or to declare **per-replica volume
@@ -446,7 +457,9 @@ and is destroyed on merge or TTL.
 
 **Feature surface for parity** — carried from the original Vesta spec and the Rust agent's
 module list, which was already the right decomposition: builds, deployments, domains,
-health, logs, exec, maintenance mode, backups, cron, deploy hooks, service links,
+health, logs, exec, maintenance mode, backups, cron, deploy hooks, service links
+(ARCHITECTURE §7.5 — east-west is default-deny; a link grants network membership, injects
+connection variables, and co-locates the workloads, all from one declaration),
 notifications, webhooks (HMAC-signed), audit, resource limits, team quotas, templates.
 
 ---
@@ -548,8 +561,11 @@ Acceptance: push to `main` → live in under 90 seconds warm.
 
 **M6 — Services and operations (week 14–16)**
 Managed Postgres/MySQL/Redis/Mongo, service links with template injection, encrypted
-backups to S3-compatible storage with restore drills, cron jobs, one-shot jobs, resource
-limits, quotas, notifications, maintenance mode.
+backups to S3-compatible storage with restore drills, cron and one-shot jobs, resource
+limits, quotas, notifications, maintenance mode. Job semantics are specified in
+ARCHITECTURE §13: agent-side timers so schedules keep firing while the control plane is
+down, at-most-once per window, mandatory timezones, and dead-man alerting for jobs that
+stop firing.
 
 **M7 — Fleet and polish (week 17–19)**
 Multi-server placement and constraints, spread/binpack, proxy mesh and internal DNS

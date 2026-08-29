@@ -5,7 +5,8 @@ specifies *how the pieces fit*, precisely enough to implement from. Where the tw
 disagree, this document wins on mechanism and the plan wins on scope.
 
 Read in order: §2 for the process model, §3 for the Spec (everything else is downstream of
-it), §6 for the reconciler, §10 for DNS, §11 for secrets. The rest can be read on demand.
+it), §6 for the reconciler, §10 for DNS, §11 for secrets, §13 for jobs, §15.1–15.6 for
+logs. The rest can be read on demand.
 
 ---
 
@@ -79,7 +80,7 @@ network namespace inspection for socket handoff peer checks, and tmpfs mount con
 Note what is absent: no secret is written under `/var/lib`, and `spec.json` is
 deliberately stripped of `Secrets` before it is persisted. On a cold boot the agent can
 reconstruct containers but must re-obtain secrets from the control plane. That is a
-deliberate availability-for-confidentiality trade (§15).
+deliberate availability-for-confidentiality trade (§16).
 
 ---
 
@@ -99,6 +100,7 @@ type Spec struct {
     Issued   time.Time
     Apps     []AppSpec
     Routes   []RouteSpec
+    Bindings []PortBinding // L4 host-port bindings owned by this node (§7.4)
     Jobs     []JobSpec
     Secrets  []SealedBundle // sealed to this node's key; opaque to everything but the agent
     Prune    PrunePolicy    // what the agent may delete when it finds unmanaged leftovers
@@ -152,8 +154,10 @@ type SealedBundle struct {
 - **`Env` cannot carry secrets.** The type doesn't forbid it; the *pipeline* does — the
   control plane's spec generator draws non-secret config from one table and secrets from
   another, and a validator rejects a Spec whose `Env` values match any known secret value.
-- **`Ports` are container-internal.** There is no host-port field. The absence of the
-  field is what makes replicas work (§7.1).
+- **`Ports` are container-internal.** `AppSpec` has no host-port field, and that absence is
+  what makes replicas work (§7.1). Host ports are not forbidden — they are modeled
+  separately as `PortBinding` (§7.4), owned by a registry that detects conflicts, so a
+  binding is always a deliberate, named allocation and never an accident of app config.
 - **`SpecHash` covers everything that requires a container replacement.** Fields that can
   be changed in place (labels used only for display, log retention) are excluded from the
   hash so that changing them doesn't recreate a container.
@@ -419,12 +423,15 @@ attached to the host. Consequences:
   the entire reason Coolify cannot do replicas on one server.
 - `docker ps` shows no exposed ports, and nothing on the box is reachable from outside
   except through the proxy. Port exposure becomes a routing decision, not a runtime one.
-- An app can be made deliberately host-published (legacy TCP services, a game server) via
-  an explicit `hostPort` escape hatch, which sets `replicas: 1` and says why.
+- Workloads that genuinely need a real port (Postgres, SMTP, game servers) get one through
+  a registered `PortBinding` (§7.4) rather than an ad-hoc field. In the default *Proxied*
+  mode a binding **keeps replicas** — the proxy owns the port and load-balances behind it.
+  Only *Direct* mode, where Docker publishes the port itself, is limited to one replica.
 
-Docker's embedded DNS resolves sibling containers by service name inside the app-env
-network, so service-to-service calls inside one environment work without the proxy.
-Cross-environment traffic must go through the proxy, by design.
+Docker's embedded DNS resolves containers by service name inside a network, so a linked
+service is reachable as `postgres:5432` with no proxy in the path. Which containers share a
+network is not automatic: membership is granted by an explicit `ServiceLink` (§7.5), so
+east-west connectivity is default-deny rather than "everything on one bridge".
 
 ### 7.2 Volumes
 
@@ -449,6 +456,223 @@ Every container gets: `--memory`, `--memory-swap` equal to memory (no swap thras
 `--cpus`, `--pids-limit`, and `--log-driver local --log-opt max-size=10m --log-opt
 max-file=3`. The default `json-file` driver with no rotation is how self-hosted PaaS
 installs fill their disks; we never use it.
+
+### 7.4 Binding host ports, deliberately
+
+§7.1 removes host ports from the *default* path. But plenty of real workloads must answer
+on a real port: Postgres on 5432 for an external BI tool, SMTP on 25, a Gitea SSH endpoint
+on 2222, MQTT on 8883, a game server on UDP 27015. "Everything is HTTP behind a
+hostname-routing proxy" is a comfortable assumption that self-hosting reality punctures
+within a week.
+
+So a host port is a **first-class object with its own registry** — not a field someone types
+into an app config and hopes about.
+
+```go
+type PortBinding struct {
+    ID         string
+    App, Env   string
+    Proto      Proto      // TCP | UDP
+    HostIP     string     // interface to bind; NOT 0.0.0.0 by default (see below)
+    HostPort   int        // explicit, or 0 to allocate from the configured range
+    TargetPort int        // the container port
+    Mode       BindMode   // Proxied (default) | Direct
+    TLS        TLSPolicy  // Terminate | Passthrough | Off — Proxied only
+    ProxyProto bool       // send PROXY protocol v2 to the backend
+    Nodes      []string   // which nodes bind it; resolved by placement
+    AllowCIDR  []string   // source restriction
+}
+```
+
+**This is not NodePort.** Kubernetes NodePort allocates an arbitrary high port on *every*
+node and leaves you to put something in front of it. A Vesta binding is a named, registered
+allocation of a *specific* port on *specific* nodes, chosen by the operator, with conflicts
+detected before deployment rather than discovered during one.
+
+#### Two modes, and why the default is the interesting one
+
+| | **Proxied** (default) | **Direct** |
+|---|---|---|
+| Mechanism | `vesta-proxy` opens an L4 listener and forwards to container IPs | Docker publishes the port (`-p`) |
+| **Replicas** | **N, load-balanced** | **1 per port per node** |
+| Zero-downtime deploy | **yes** — replicas swap behind a stable listener | no — the port must be released before rebinding |
+| Health-based ejection | yes | no |
+| Source IP at backend | the proxy's, unless `ProxyProto` | preserved |
+| TLS termination | yes, where the protocol allows | no |
+| Source allowlist | enforced by the proxy | host firewall's job |
+| UDP | session-based forwarding | full, lowest overhead |
+
+The first two rows are the point. Docker's `-p` binds one container to one port, which is
+precisely the constraint that forces one replica — the same limitation that stops Coolify at
+one container per app, reappearing for TCP. **Putting the proxy on the port instead extends
+the replica model to non-HTTP services**: four Postgres read replicas or four MQTT brokers
+behind one bound port, health-checked, with a rolling deploy that never drops the listener.
+
+Direct mode exists for the cases where proxying is genuinely wrong: a backend that needs the
+real client IP and can't speak PROXY protocol (Postgres, notably), UDP workloads sensitive
+to added latency, or protocols the L4 path handles poorly. It is a deliberate choice with
+its costs written down, not a silent fallback.
+
+#### TLS on bound ports
+
+Where a protocol is *plain TLS from the first byte* — MQTTS 8883, SMTPS 465, TLS-wrapped
+Redis — the proxy terminates with the same certificate machinery as HTTP (§9.4), and the
+service behind it speaks plaintext. Where a protocol negotiates TLS mid-stream (STARTTLS on
+SMTP 587, Postgres's own handshake), termination is impossible and the binding is
+passthrough: the application does its own TLS with a certificate Vesta can still provision
+and mount. Both are supported; the doc names which is which, because "why doesn't TLS
+termination work for Postgres" is otherwise a support ticket.
+
+SNI-based routing lets several TLS services share one bound port, the same way virtual hosts
+share 443.
+
+#### Allocation and conflict
+
+The control plane owns a port registry, unique on `(node, host_ip, proto, host_port)`.
+
+- **Conflicts are a validation error at save time**, with the conflicting app named — never
+  a container that fails to start at 2 a.m. because something else already holds 5432.
+- **Ports occupied by non-Vesta processes are detected too.** Agents report their listening
+  sockets at enrollment and on each resync, so requesting a port already held by the host's
+  own Postgres or sshd is refused with an explanation instead of producing a crash-looping
+  container.
+- 80 and 443 belong to `vesta-proxy`; 22 and a configurable reserved list are refused.
+- `HostPort: 0` allocates from a configured range for people who just need *a* port.
+
+#### Bind address defaults, which are a security decision
+
+`HostIP` defaults to the **private interface, not `0.0.0.0`**. Publishing to every interface
+is an explicit opt-in that shows what it means before you confirm it:
+
+```
+  This will expose postgres-prod on 5432 to the public internet.
+  Reachable from: 0.0.0.0  ·  Source allowlist: none
+  Managed databases are normally reached over the app network or a private interface.
+```
+
+Managed databases (§14) get **no binding at all** by default — they are reachable inside the
+app-environment network by service name, which is what an application actually needs.
+Exposing one is a decision someone makes on purpose. Self-hosted databases left listening on
+`0.0.0.0` are a well-documented mass-scanning target, and a platform whose default quietly
+does that is choosing convenience over its users.
+
+`AllowCIDR` is enforced in the proxy for Proxied bindings. In Direct mode the host firewall
+owns it; the agent can optionally manage an nftables set, but this is opt-in because
+silently rewriting someone's firewall is not a thing a deployment tool should do uninvited.
+
+#### Fleet behavior
+
+A bound port lives on the nodes named in the binding, and placement keeps the app's replicas
+on those nodes. Vesta does **not** open the port fleet-wide the way NodePort does — an
+unused listener on every machine is attack surface with no benefit.
+
+For multi-node reachability, the choices are the same as §10.2 and equally explicit: point
+DNS at the bound nodes, put a floating IP in front, or enable L4 mesh forwarding so any node
+accepts the port and forwards to an owner. Mesh forwarding for TCP is available but **off by
+default** — an extra network hop matters far more for a database connection than for an HTTP
+request, and pinning is usually the better answer.
+
+### 7.5 Service links: how containers reach each other
+
+Most PaaSes in this category put every container on one shared bridge network. It makes
+`postgres:5432` work immediately, and it means any compromised container can reach every
+database, cache, and internal API on the box — including other teams'. Convenience bought
+with a flat network is the same trade as convenience bought with plaintext secrets.
+
+**Vesta is default-deny east-west.** Two containers can talk if, and only if, a
+`ServiceLink` says so. The link is the authorization, and Docker network membership is the
+enforcement — not a convention, not a firewall rule someone can forget, but the absence of
+a route.
+
+```go
+type ServiceLink struct {
+    ID       string
+    From     string // consuming app-environment
+    To       string // target app-environment or managed service
+    Alias    string // DNS name the consumer uses: "postgres", "api"
+    Inject   []string // env vars to generate: DATABASE_URL, REDIS_URL, …
+    Path     LinkPath // Direct (default) | Proxied
+}
+```
+
+#### One declaration, three effects
+
+Creating a link does three things at once, which is what makes it a useful primitive rather
+than a naming convenience:
+
+1. **Connectivity.** Both containers join a shared link network `vesta_link_<from>_<to>`,
+   and the target gets the network alias `Alias`. Nothing else on the host joins it.
+2. **Configuration.** Connection variables are generated and injected — `DATABASE_URL`,
+   `REDIS_URL`, host/port/credential triplets — resolved at deploy time through the
+   `{{services.*}}` template path, with credentials drawn from the secrets system (§11), not
+   written into config.
+3. **Placement affinity.** The scheduler prefers to co-locate linked workloads on the same
+   node (§5). This is not cosmetic — see the cross-node problem below.
+
+Unlinking removes all three. There is no orphaned network membership and no stale
+`DATABASE_URL` pointing at something the app is no longer allowed to reach.
+
+#### Two ways to address a service
+
+| | **Direct** (`postgres:5432`) | **Proxied** (`api.prod.vesta.internal`) |
+|---|---|---|
+| Resolution | Docker embedded DNS, network alias | agent resolver → local `vesta-proxy` (§10.5) |
+| Path | container → container, one hop | container → proxy → container |
+| Works cross-node | no | yes, via the mesh (§10.1) |
+| Load balancing | round-robin DNS, health-unaware | connection-level, health-aware, ejects failures |
+| Best for | managed databases, caches, singletons | app → app, anything replicated |
+
+**The rule: Direct for singletons, Proxied for replicated apps.** Docker's embedded DNS
+returns every alias A-record in random order, and many clients use only the first and cache
+it — so DNS round-robin across four replicas of an API silently becomes "one replica gets
+everything, and keeps getting it after it dies." That is a bad default for app-to-app
+traffic and a perfectly good one for reaching a single Postgres. Links to replicated targets
+default to `Proxied`; links to singleton services default to `Direct`.
+
+#### The cross-node problem, stated plainly
+
+**Docker bridge networks are node-local.** A link network on node 1 does not extend to node
+3. This is the single most important constraint in the whole east-west story, and it has
+exactly three honest answers — we take the first two and refuse the third:
+
+1. **Co-locate.** Linked workloads are scheduled together by default. An app and its
+   database on one node is the common case, the fast case, and the case that needs no
+   distributed anything. Most installs never leave here.
+2. **Route through the proxy mesh.** When co-location is impossible — the target is pinned
+   elsewhere, or the app spans nodes — the `Proxied` path handles it: the local proxy
+   forwards to a peer over mTLS (§10.1). Costs a hop, gains health-aware balancing and
+   encryption on the wire between machines.
+3. ~~Build an overlay network.~~ We do not ship a CNI, VXLAN, or WireGuard mesh to make
+   bridge networks span hosts. That is the machinery people left Kubernetes to escape, it is
+   the component most likely to break at 3 a.m., and the proxy path already covers the case
+   it would serve.
+
+A `Direct` link whose target lands on another node is a **validation error at link time**,
+naming the problem and offering the two fixes — not a connection refused discovered in
+production. If the target later moves, the reconciler reports the link as broken rather than
+silently failing to connect.
+
+#### Boundaries
+
+- **Within an environment**, links are ordinary and encouraged.
+- **Across environments** (staging → production database) requires an explicit override with
+  a warning and an audit record. It is a real thing people occasionally need and a much more
+  common thing people do by accident, and the accident is expensive.
+- **Across projects** requires authorization on both sides — the target project's owner
+  approves. A link is an access grant, so it follows the same consent model as any other.
+- **Across teams** is not offered. Publish an API through the proxy with real authentication
+  instead; a Docker network is not an authorization system.
+
+Every link creation, override, and removal is an audited event (axiom 5).
+
+#### What this costs
+
+Being honest about the trade: a flat network means `postgres:5432` works the instant you
+create a database, and Vesta makes you create a link first. That is one extra step, and it
+is generated for you when a database is provisioned from within a project — the common path
+still feels automatic. What you get for the step is that a compromised container reaches
+exactly the services it was granted and nothing else, which is the property that makes a
+multi-app server survive a single bad dependency.
 
 ---
 
@@ -525,8 +749,9 @@ The agent is the only writer. Over `/run/vesta/proxy.sock`:
 
 ```go
 type ProxyConfig struct {
-    Revision string
-    Routes   []Route
+    Revision  string
+    Routes    []Route      // HTTP/HTTPS, matched by host and path
+    Listeners []L4Listener // raw TCP/UDP bound ports (§7.4), matched by port and SNI
 }
 
 type Route struct {
@@ -734,8 +959,9 @@ Everything else forwards to the host's configured resolvers. Traffic to
 `api.prod.vesta.internal` therefore reaches the local proxy, which applies §10.1: local
 replica if there is one, mesh hop if not. The consequences are the ones that matter:
 
-- Service links inject `http://api.prod.vesta.internal` rather than a public URL, so
-  east-west traffic never egresses to the internet and back.
+- Service links (§7.5) inject `http://api.prod.vesta.internal` rather than a public URL, so
+  east-west traffic never egresses to the internet and back. This is the `Proxied` link
+  path; `Direct` links use the short alias and skip the proxy entirely.
 - The name is stable across redeploys, rescheduling, and scaling — it resolves to a proxy,
   never to a container IP.
 - Cross-environment calls remain explicit and routable, while staying inside the fleet.
@@ -890,8 +1116,216 @@ A static, dependency-free binary (~2 MB, `CGO_ENABLED=0`). Correctness requireme
   builds images: `POST /apps/{app}/releases {image: "repo@sha256:..."}`.
 
 ---
+## 13. Jobs and scheduled work
 
-## 13. Data model
+Cron is where PaaSes quietly get things wrong: a job that fires twice, a job that silently
+stops firing for three weeks, a job that runs last month's code, a nightly batch that
+starves the web replicas it shares a box with. Each of those is a design decision made
+badly, so each gets made explicitly here.
+
+### 13.1 Four kinds, one runner
+
+| Kind | Trigger | Notes |
+|---|---|---|
+| `Cron` | schedule | recurring; the subject of most of this section |
+| `Manual` | operator or API | `vesta job run migrate --env prod`; the same machinery |
+| `PreDeploy` / `PostDeploy` | a deployment | a failing `PreDeploy` aborts the rollout (§8) |
+| `Build` | a release | builds are one-shot jobs with a different image and no app secrets |
+
+All four are *run-to-completion containers* and share one runner, one run-record table, one
+log path, and one timeout mechanism. Only the trigger differs. Keeping them unified means
+the run history, retry logic, and alerting written for cron work for deploy hooks for free.
+
+### 13.2 Where the desired-state model stops
+
+Jobs are the one place the reconciler's model does not apply cleanly, and pretending
+otherwise produces bugs. **A schedule is desired state; a run is an event in time.** You
+cannot converge toward "the 03:00 backup happened" — either it did or the moment passed.
+
+So the split is:
+
+- The **`JobSpec` is part of the Spec** and is reconciled like everything else: the agent
+  guarantees the schedule is registered and matches. Idempotent, drift-correcting, ordinary.
+- The **run is imperative** and is recorded, not reconciled. A missed run is a historical
+  fact, not a diff to be repaired.
+
+Getting this backwards — treating a run as state to converge on — is how schedulers end up
+firing twelve accumulated executions at once after an outage.
+
+### 13.3 The control plane decides *where*; the agent decides *when*
+
+```go
+type JobSpec struct {
+    ID       string
+    App, Env string
+    Kind     JobKind        // Cron | Manual | PreDeploy | PostDeploy | Build
+    Scope    JobScope       // SingleNode (default) | EveryNode
+
+    Schedule string         // cron expression; Kind == Cron
+    Timezone string         // IANA name, REQUIRED for Cron — no implicit UTC, no host local
+    Image    string         // digest, pinned at spec generation
+    Command  []string
+
+    Env        map[string]string
+    SecretRef  string       // same sealed-bundle path as an app (§11)
+    SecretsVer int
+    Resources  Resources    // mandatory, not optional — see §13.7
+    Volumes    []VolumeMount
+    Networks   []string     // usually the app-env network, to reach the database
+
+    Timeout       time.Duration      // default 1h
+    Concurrency   ConcurrencyPolicy  // Forbid (default) | Allow | Replace
+    CatchUp       bool               // default false
+    CatchUpWindow time.Duration      // how late is still acceptable; default 10m
+    Retries       int                // default 0
+    BackoffBase   time.Duration
+    History       HistoryPolicy      // keep N runs / M days
+}
+```
+
+**Exactly one node owns a `SingleNode` job.** The control plane picks the owner during spec
+generation and simply *omits the job from every other node's Spec*. There is no election, no
+lease, no distributed lock — the same placement machinery that decides where replicas run
+decides where a job runs, and the property "only one node will fire this" is enforced by the
+job not existing anywhere else.
+
+**The agent, not the control plane, holds the timer.** The consequence is the one that
+matters operationally: **cron keeps firing while the control plane is down.** A scheduler
+that lives in the control plane makes every panel outage a silent data-pipeline outage, and
+the alerting for it usually doesn't exist. This follows axiom 2 — the agent is authoritative
+for its host.
+
+`Scope: EveryNode` exists for genuinely per-host work (log pruning, image GC) and fires on
+every node holding the Spec.
+
+### 13.4 Firing semantics
+
+The defaults are chosen so that the *surprising* behavior never happens silently.
+
+**Missed windows do not accumulate.** If the node was down, or the previous run overran, the
+missed window is recorded as `missed` and **never fired late** unless `CatchUp` is on. A
+"send the daily report" job run six hours late is usually worse than one not run at all, and
+the operator should decide which. With `CatchUp: true` a window is run only if discovered
+within `CatchUpWindow`, and only **once** — accumulated windows collapse to a single
+execution, always. Vesta will never fire a burst to "catch up."
+
+**Concurrency** when the previous run is still going:
+
+| Policy | Behavior |
+|---|---|
+| `Forbid` (default) | skip the new window, record `skipped_overlap`, alert if it repeats |
+| `Allow` | run concurrently; the operator is asserting the job is safe to overlap |
+| `Replace` | SIGTERM the running one, wait `StopGrace`, then start the new |
+
+**Timezone is mandatory and DST is handled explicitly.** A cron expression without an IANA
+timezone is rejected at validation, because the two implicit answers — UTC, or the host's
+local zone — are each wrong half the time, and the host's zone means a job silently changes
+behavior when it is rescheduled to a different server. Across DST transitions:
+
+- **Nonexistent local time** (spring forward; 02:30 does not occur): the window is skipped
+  and recorded as `skipped_dst`. It is not shifted to 03:30, because a job pinned to a
+  maintenance window should not wander into business hours.
+- **Ambiguous local time** (fall back; 02:30 occurs twice): fires **once**, on the first
+  occurrence.
+- **Interval schedules** (`@every 30m`) are computed in UTC and are unaffected by either.
+
+### 13.5 At-most-once, and saying so
+
+Vesta gives **at-most-once per window**, not exactly-once. Exactly-once across a network
+does not exist, and a platform that implies otherwise teaches users to write jobs that
+corrupt data when the guarantee turns out to be probabilistic. The documentation says: make
+jobs idempotent.
+
+What is guaranteed, and how:
+
+- **No double-fire on one node.** Before starting, the agent writes a run record keyed by
+  `(job_id, window_start)` to `/var/lib/vesta/jobs.db`. A window that already has a record is
+  never started again — so an agent restart, a spec reapplication, or a duplicated timer
+  cannot double-fire. This state is retained across restarts and contains no secrets.
+- **No double-fire across nodes**, because only one node has the job (§13.3).
+- **Owner reassignment is deliberate.** If the owner is unreachable, the control plane moves
+  ownership on the next spec generation. Both being down means the window is missed and
+  recorded as such — not run twice later.
+- **A run interrupted by node death is recorded `lost`, never `failed` or `succeeded`.** We
+  do not know whether the side effect happened, and the honest status is the one that says
+  so. `lost` runs are surfaced distinctly in the UI because they are the ones a human must
+  reason about.
+
+### 13.6 What a job actually runs
+
+A **fresh one-shot container from the environment's current release digest**, pinned at fire
+time — the same image, secrets, environment, and network as the app's replicas, with its own
+resource limits.
+
+```
+container: vesta_<app>_<env>_job_<jobname>_<runid>
+labels:    sh.getvesta.managed=true  .job=<jobname>  .run=<runid>  .release=<release>
+network:   the app-env network, so the database is reachable by service name
+secrets:   the same sealed-bundle → tmpfs → vesta-init path as any container (§11.3)
+```
+
+Two properties fall out of this that are worth naming:
+
+- **A cron job runs the same code as the app**, because it comes from the same release
+  digest. Jobs quietly running a months-old image is a classic failure of platforms that
+  build job images separately.
+- **Pinning is at fire time.** A deploy landing mid-run does not change the image under a
+  running job; the run completes on the release it started with, and its run record names
+  that release.
+
+**Exec mode.** As an option, `mode: exec` runs the command inside an existing replica
+instead of starting a container. It is cheaper (no container start, warm caches) and some
+frameworks assume it. The trade-offs are real and documented: the job shares the replica's
+resource limits, it dies if that replica is redeployed or restarted mid-run, it cannot run
+when the app is scaled to zero, and its resource usage is attributed to a serving container.
+Default is a separate container; exec is opt-in per job.
+
+### 13.7 Not starving production
+
+Job containers are not replicas: they never join the proxy pool, never count toward replica
+counts, and never receive traffic. But they compete for the same CPU and memory, and a
+nightly batch that OOMs the web tier is a self-inflicted outage.
+
+- **Resource limits on jobs are mandatory**, not optional. A `JobSpec` without them fails
+  validation. Defaults are inherited from the app but must resolve to something concrete.
+- Jobs run with reduced CPU shares by default, so a busy job yields to serving traffic
+  rather than competing evenly with it.
+- A per-environment cap limits concurrent job containers; excess windows are `skipped_cap`
+  with an alert rather than being queued indefinitely.
+- The scheduler counts job reservations against node capacity (§5), so a node packed to its
+  memory limit is not also chosen as a job owner.
+
+### 13.8 Runs, logs, retention
+
+Every run produces a record: job, run id, release digest, node, trigger (schedule / manual /
+API, with the actor for manual), window start, actual start, end, duration, exit code,
+status, and retry index.
+
+- **Output flows through the same redaction filter as build and deploy logs** (§11.5) — jobs
+  receive secrets, and a job that echoes its environment on failure is a common leak.
+- Retention per `HistoryPolicy`; run containers are removed after their logs are captured.
+- On agent restart, running job containers are **adopted** via their labels rather than
+  duplicated or orphaned.
+- Timeout exceeded → SIGTERM, then SIGKILL after `StopGrace`, status `timed_out`.
+
+### 13.9 Alerting — including the silence
+
+Failure alerts are table stakes. The two that matter more, and that most platforms omit:
+
+- **Missed and skipped windows alert.** A job that stops firing is invisible precisely
+  because nothing happens. `missed`, `skipped_overlap`, and `skipped_cap` are alertable
+  conditions, not just log lines.
+- **Dead-man check.** Each cron job carries an expected-interval derived from its schedule;
+  the control plane raises an alert when no run has *started* within that interval plus a
+  grace factor. This catches the failure mode no per-run alert can: the schedule silently
+  not being registered at all — a bad expression, an owner node that never came back, a spec
+  that never reached anyone.
+
+Both are computed by the control plane from run records, so they still fire when the problem
+is that the agent has gone quiet.
+
+
+## 14. Data model
 
 Sketch of the schema, sqlc-generated accessors, goose migrations. Postgres and SQLite
 share DDL except for type aliases.
@@ -928,6 +1362,9 @@ Rules:
   shell on anything. The legacy Rust schema had `ssh-key.entity.ts` because it drove
   servers over SSH; porting it would reintroduce the skeleton-key problem (PLAN §1.4) that
   the transport design exists to eliminate.
+- `job_runs` is append-only and is the source for both history and the dead-man checks in
+  §13.9; a run row is written *before* the container starts, which is what makes the
+  at-most-once dedupe key work across an agent restart.
 - `instances` is a *cache* of agent-reported state, never a source of truth. If it
   disagrees with an agent, the agent is right.
 - `events` is the append-only projection source for the UI stream and webhooks;
@@ -935,30 +1372,193 @@ Rules:
 
 ---
 
-## 14. Observability
+## 15. Observability
 
-**Logs.** The agent tails container stdout/stderr via the Docker API into a bounded
-per-container ring buffer on the host (immediately available for `vesta logs`, survives a
-control-plane outage), and ships asynchronously upstream for search and retention. Lossy
-under backpressure by design, with a visible dropped-line counter — a full log pipeline
-must never block or crash an application.
+### 15.1 Logs: two systems, not one
 
-**Metrics.** Agent samples container CPU/memory/network/disk from Docker's stats stream at
-a low frequency (10 s) and reports deltas on the control stream. Not a Prometheus
-replacement; enough to drive the dashboard and autoscaling triggers. OTLP export is
-available for people who want the real thing.
+The common mistake is building one log pipeline and using it for both jobs it has to do.
+They have opposite requirements:
 
-**Events.** Every state transition emits to the internal bus: deployment phases, replica
-health flips, probe failures, cert issuance, secret reveals, quota rejections. The UI's
-live view is a websocket subscription to this bus, filtered by team. Nothing in the UI
-polls.
+| | Live tail | History and search |
+|---|---|---|
+| Question | "what is happening right now" | "what happened at 03:00 on Tuesday" |
+| Latency | sub-second | seconds is fine |
+| Loss | acceptable, if visible | not acceptable |
+| Retention | none — it's a view | days to months |
+| Volume handling | drop and say so | store and index |
 
-**Audit.** Actor, action, target, IP, timestamp, outcome, and — for secret reveals — the
-stated reason. Immutable, exportable, retained independently of the general event log.
+Vesta builds both, with different guarantees, over one line format and one transport.
+
+**The organizing decision: the node is the log store; the control plane is a query
+router.** Logs are not continuously shipped to the control plane on the chance that someone
+will look at them. They are read from the node on demand. This follows the same axiom as
+everything else — the agent is authoritative for its host — and it means log viewing keeps
+working during a control-plane outage, there is no ingest pipeline to fall over, and a
+chatty app cannot fill the control plane's disk.
+
+### 15.2 The line envelope
+
+Every line from every source — app replicas, builds, job runs, deploy steps, the agent
+itself — arrives in one shape, so one viewer, one filter language, and one retention policy
+cover all of them.
+
+```go
+type LogLine struct {
+    Time     time.Time  // the container's own timestamp, RFC3339Nano from Docker
+    Seq      uint64     // per-container monotonic counter — exact intra-container ordering
+    Node     string
+    App, Env string
+    Replica  int
+    Release  string
+    RunID    string     // job or build run, when applicable
+    Source   LogSource  // Stdout | Stderr | Build | Job | Deploy | Agent
+    Text     string
+}
+```
+
+`Seq` matters: timestamps collide at high volume and clocks are not trustworthy across
+nodes, so ordering *within* one container is defined by `Seq`, not by time. This is what
+lets the UI guarantee that a stack trace is never interleaved with itself.
+
+### 15.3 Reading from Docker
+
+The agent reads via the Engine API's `ContainerLogs` with `Follow`, `Timestamps`, `Tail`,
+and `Since`. Two mechanics that routinely cost people a day:
+
+- **The stream is multiplexed.** Without a TTY, stdout and stderr arrive framed with an
+  8-byte header per chunk and must be demultiplexed (`stdcopy`), not read as raw bytes.
+- **Only the `json-file` and `local` drivers are readable.** We set `local` with rotation
+  (§7.3), which the API can read across rotated files — so recent history is queryable from
+  Docker itself with no storage of our own. A user who overrides the log driver to syslog or
+  fluentd loses the log UI entirely; that escape hatch exists, and it says so at the moment
+  it is chosen rather than producing an empty log pane later.
+
+**Redaction happens at the agent, before a line leaves the node** (§11.5). Secrets never
+traverse the network and never enter control-plane memory in order to be scrubbed at
+display time.
+
+**Logs survive the container that wrote them.** On container removal — including every
+redeploy — the agent copies the final log to
+`/var/lib/vesta/logs/<app>/<env>/<release>/<replica>.log` before removing it. This is
+deliberate: "I redeployed and the crash logs vanished with the container" is the single most
+common real-world log complaint in this category, and it is caused by treating Docker's
+per-container log as the only copy.
+
+### 15.4 Live tail across a fleet
+
+```
+ browser  ──WS subscribe {app, env, filter}──▶  vestad
+                                                  │ authz: team scope + logs:read
+                                                  │ fan out to nodes holding replicas
+                          ┌───────────────────────┼───────────────────────┐
+                          ▼                       ▼                       ▼
+                    control stream          control stream          control stream
+                    OpenStream{logs}        OpenStream{logs}        OpenStream{logs}
+                          │                       │                       │
+                    agent dials back        agent dials back        agent dials back
+                    Logs RPC ──────┐        Logs RPC ──────┐        Logs RPC ──────┐
+                                   ▼                       ▼                       ▼
+                          ┌──────────────────────────────────────────────────┐
+                          │  vestad: k-way merge, 250ms reorder buffer,      │
+                          │  rate cap, drop accounting                       │
+                          └───────────────────────┬──────────────────────────┘
+                                                  ▼
+                                          one merged WS stream
+```
+
+Five decisions in that path:
+
+**Subscription-driven, not always-on.** The control plane asks for logs only for the
+containers someone is actually watching, and tells the agent to stop when the last
+subscriber disconnects. Idle apps cost nothing.
+
+**A separate stream from the control stream.** Log volume must never apply backpressure to
+Spec delivery or health reporting. The agent dials a distinct `Logs` RPC (§6.1) on the same
+gRPC connection, so a torrent of log lines can be throttled or dropped without touching
+control traffic.
+
+**Filters are pushed down to the agent.** A substring, regex, level, or stream filter is
+evaluated on the node. Shipping 50k lines/second across the network to discard 49.9k of them
+at the control plane is the difference between a feature and an incident.
+
+**Cross-node ordering is best-effort, and we say so.** The control plane k-way merges by
+timestamp through a bounded ~250 ms reorder buffer. Within a container, order is exact
+(`Seq`). Across nodes, it is as good as the nodes' clocks — which is why the agent reports
+its clock offset and the UI shows a warning banner when a contributing node is skewed more
+than a couple of seconds. Buffering longer to hide skew would trade the "live" out of live
+tail; inventing a global order we cannot actually establish would be worse.
+
+**Loss is bounded, visible, and never upstream.** Every hop drops rather than blocks: the
+agent's per-container ring buffer, the CP's per-subscription rate cap, and the WebSocket
+send buffer for a slow browser. Each drop emits a marker line — `… 4,812 lines dropped
+(rate limit) …` — so a user is never shown a quiet, incomplete stream. The application is
+never blocked by anyone reading its logs.
+
+**Reconnection** resumes from the last seen `(node, container, Seq)` with a short backfill,
+deduplicating on that key. At-most-once delivery with visible gaps, not silent ones.
+
+### 15.5 History and search
+
+A history query is a scatter-gather, not a database read:
+
+1. The control plane resolves the time range to the set of `(node, release, replica)` that
+   existed during it, using deployment records.
+2. It queries only those nodes, passing the time range, filters, and a line limit.
+3. Agents read from Docker's rotated files and from the preserved logs of removed
+   containers, filter locally, and return bounded pages.
+4. The control plane merges and returns a cursor for the next page.
+
+Retention is per-environment `LogRetentionPolicy`, enforced by the agent on its own disk.
+
+**Optional tiers**, for people who need more than this:
+
+- **Persist to the control plane** — opt-in per environment, for cross-app search and for
+  retaining logs beyond a node's life. Off by default, because it is the setting that turns
+  a busy app into a control-plane disk problem.
+- **Forward to an external sink** — OTLP, Loki, S3, or syslog. We are not building a log
+  database, and the honest scope statement is that teams who need real log infrastructure
+  should point Vesta at theirs rather than wait for us to grow one.
+
+**Stated limit:** with the default configuration, losing a node loses that node's history.
+Enabling a tier above is how you avoid that, and the docs say so plainly rather than
+implying durability we do not provide.
+
+### 15.6 Access control
+
+Logs routinely contain more sensitive data than the secrets people carefully protect.
+Accordingly, log access is its own permission (`logs:read`), scoped by team and environment
+and grantable separately from deploy rights; access to production log streams is recorded in
+the audit log with actor, environment, and time range; and multi-line filters cannot be used
+to exfiltrate around redaction, because redaction runs before filtering on the node.
+
+Concurrent subscriptions are capped per user and per node — every followed container is a
+goroutine and a file descriptor on someone's server.
+
+### 15.7 Metrics
+
+The agent samples container CPU, memory, network, and disk from Docker's stats stream at low
+frequency (10 s) and reports deltas on the control stream. This is not a Prometheus
+replacement; it exists to drive the dashboard and autoscaling triggers. OTLP export is
+available for people who want the real thing, and the node exporter path is documented for
+those who already run one.
+
+### 15.8 Events
+
+Every state transition emits to the internal bus: deployment phases, replica health flips,
+probe failures, cert issuance, secret reveals, job runs, quota rejections. The UI's live view
+is a WebSocket subscription to this bus, filtered by team — the same multiplexed connection
+that carries log subscriptions, so a browser tab holds one socket, not one per panel.
+Nothing in the UI polls.
+
+### 15.9 Audit
+
+Actor, action, target, IP, timestamp, outcome, and — for secret reveals — the stated reason.
+Immutable, exportable, and retained independently of the general event log, so trimming
+event history never trims the security record.
 
 ---
 
-## 15. Failure modes
+## 16. Failure modes
 
 | Failure | Behavior | Recovery |
 |---|---|---|
@@ -972,14 +1572,18 @@ stated reason. Immutable, exportable, retained independently of the general even
 | Mesh peer unreachable mid-request | Entry proxy returns 502 for that request and marks the peer down for subsequent ones. | Passive ejection with exponential re-admission; local upstreams are always preferred anyway. |
 | Deploy fails health gate | New replicas destroyed, old ones never left the pool, deployment marked `failed` with the failing probe output. | Automatic. Nothing to undo. |
 | Disk full on app server | Log rotation caps container logs; agent's ring buffers are bounded; image GC runs on a watermark. | Watermark-triggered prune of unreferenced images and stopped containers. |
+| Log volume exceeds what a viewer can consume | Lines are dropped at the narrowest hop and a `… N lines dropped …` marker is emitted. The application is never blocked. | Nothing to recover; the gap is visible, and history (§15.5) still has the lines Docker retained. |
+| Node lost with default log config | That node's history is gone with it. | Accepted default (§15.5). Opt into control-plane persistence or an external sink to avoid it. |
+| Linked target scheduled onto another node | A `Direct` link is refused at link time with both fixes offered; an existing link whose target moves is reported broken by the reconciler. | Co-location is the default (§7.5); switching the link to `Proxied` routes it over the mesh. |
+| Requested host port already in use | Rejected at save time, naming the conflicting app or the non-Vesta process holding it. No container is created. | Agents report listening sockets at enrollment and each resync, so the registry knows about ports it does not own (§7.4). |
 | Clock skew between CP and node | Spec ordering uses `Issued`; large skew could cause a Spec to be ignored. | Agent rejects Specs more than 5 min in the future and raises an event. |
-| Bad agent release | Workloads unaffected — containers are not children of the agent. The canary node fails to confirm and reverts to the previous binary. | Trial-and-revert (§17.6); the fleet rollout halts automatically, so only the canary was ever exposed. |
-| Agent too old to understand the current Spec | Connects, is marked `outdated`, refuses the Spec, and is offered an update over the frozen channel. | The Hello/Update messages never change incompatibly (§17.2), so no agent is ever unreachable. |
+| Bad agent release | Workloads unaffected — containers are not children of the agent. The canary node fails to confirm and reverts to the previous binary. | Trial-and-revert (§18.6); the fleet rollout halts automatically, so only the canary was ever exposed. |
+| Agent too old to understand the current Spec | Connects, is marked `outdated`, refuses the Spec, and is offered an update over the frozen channel. | The Hello/Update messages never change incompatibly (§18.2), so no agent is ever unreachable. |
 | Migration fails mid-update | `vestad` aborts startup and does not serve; the previous binary can be restarted against the pre-migration backup. | Expand/contract means the prior release still reads the schema; SQLite is copied before migrating, Postgres uses an advisory lock. |
 
 ---
 
-## 16. Security boundaries
+## 17. Security boundaries
 
 ```
    internet ──▶ vesta-proxy    untrusted input, no secrets, unprivileged, own process
@@ -1000,7 +1604,7 @@ stated reason. Immutable, exportable, retained independently of the general even
   is no `ssh_keys` table, no encrypted key blob, no credential of any kind that grants a
   shell. This is a direct consequence of the agent dialing out (§6.1): a system that never
   initiates a connection needs nothing to authenticate with. The legacy Rust schema's
-  `ssh-key.entity.ts` is deliberately **not** ported (§13).
+  `ssh-key.entity.ts` is deliberately **not** ported (§14).
 - Assisted bootstrap, if used, receives a key for the duration of one call and never writes
   it. A control plane that has enrolled a hundred nodes contains exactly as much SSH key
   material as one that has enrolled none.
@@ -1018,7 +1622,7 @@ stated reason. Immutable, exportable, retained independently of the general even
 
 ---
 
-## 17. Versioning and updates
+## 18. Versioning and updates
 
 Updating a fleet is the operation with the worst failure mode in the whole system: a bad
 update can strand every node at once, and the thing you would use to fix them is the thing
@@ -1102,7 +1706,7 @@ strand exactly the nodes that most need reaching.
 4. Agents reconnect on their own (§6.1 backoff). No agent action is required.
 
 **API downtime during a single-node CP update is seconds, and workloads are unaffected** —
-per §16, apps keep running, keep being health-checked, and keep being routed while the
+per §17, apps keep running, keep being health-checked, and keep being routed while the
 control plane is gone.
 
 **Downgrades are honest:** binaries roll back freely, schema does not. Migrations are
@@ -1250,7 +1854,7 @@ update policy, last update, and whether it reverted. Version drift is highlighte
 than hidden, because an un-updated node is usually the one with a problem — a full disk, a
 clock skew, a systemd unit someone edited by hand.
 
-## 18. Invariants
+## 19. Invariants
 
 Testable statements. A change that breaks one of these is a bug, and each has a
 corresponding test.
@@ -1272,18 +1876,24 @@ corresponding test.
 12. The control plane never persists an SSH private key, or any other credential granting
     shell access to a node — verified by a schema assertion and a test that greps the
     store layer, so the property cannot be lost to a well-meaning feature PR.
-13. An agent update never signals, stops, or restarts a running container.
-14. An agent binary is only executed after its Ed25519 signature verifies; a partially
+13. Two containers share a network only if a `ServiceLink` authorizes it; there is no
+    network every container joins.
+14. No log line leaves a node before passing the redaction filter.
+15. A log consumer — browser, CLI, or control plane — can never block or slow the process
+    that wrote the line; every hop drops instead, and every drop is visible to the reader.
+16. Ordering within a single container is exact, by `Seq`, regardless of timestamps.
+17. An agent update never signals, stops, or restarts a running container.
+18. An agent binary is only executed after its Ed25519 signature verifies; a partially
     downloaded artifact can never be executed, because the swap is a `rename()`.
-15. An agent that fails to confirm within its trial deadline reverts to the previous
+19. An agent that fails to confirm within its trial deadline reverts to the previous
     binary without operator action, and halts the rollout for the rest of the fleet.
-16. Killing the control plane mid-deploy leaves the environment either fully on the old
+20. Killing the control plane mid-deploy leaves the environment either fully on the old
     release or fully on the new one, never split — because the agent completes or rolls
     back the pass it started.
 
 ---
 
-## 19. Extension points
+## 20. Extension points
 
 - **Runtime** — `dockerx` is the only Moby importer. containerd/Podman is a sibling
   package satisfying the same interface.
