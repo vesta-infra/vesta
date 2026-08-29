@@ -5,7 +5,7 @@ specifies *how the pieces fit*, precisely enough to implement from. Where the tw
 disagree, this document wins on mechanism and the plan wins on scope.
 
 Read in order: §2 for the process model, §3 for the Spec (everything else is downstream of
-it), §6 for the reconciler, §10 for secrets. The rest can be read on demand.
+it), §6 for the reconciler, §10 for DNS, §11 for secrets. The rest can be read on demand.
 
 ---
 
@@ -79,7 +79,7 @@ network namespace inspection for socket handoff peer checks, and tmpfs mount con
 Note what is absent: no secret is written under `/var/lib`, and `spec.json` is
 deliberately stripped of `Secrets` before it is persisted. On a cold boot the agent can
 reconstruct containers but must re-obtain secrets from the control plane. That is a
-deliberate availability-for-confidentiality trade (§14).
+deliberate availability-for-confidentiality trade (§15).
 
 ---
 
@@ -540,10 +540,15 @@ type Route struct {
 
 type Upstream struct {
     Addr   string  // 172.20.0.11:3000 — container IP, never a host port
+    Node   string  // owning node; empty or self = local, otherwise reachable via mesh (§10.1)
     Weight int
     State  UpstreamState // Ready | Draining | Down
 }
 ```
+
+The route table a proxy holds covers the **whole fleet**, not just local apps — that is what
+lets any node accept traffic for any hostname. Upstream selection is local-first; §10.1 has
+the mesh rules.
 
 Apply is transactional: the proxy parses and validates the whole document, builds a new
 immutable routing table, and swaps an `atomic.Pointer`. In-flight requests finish against
@@ -583,7 +588,163 @@ wildcards and for nodes that aren't publicly reachable on :80.
 
 ---
 
-## 10. Secrets pipeline
+## 10. DNS and fleet ingress
+
+DNS is four separate problems that get conflated. Keeping them apart is most of the design.
+
+1. **Public resolution** — how `app.example.com` reaches *a* Vesta node.
+2. **Fleet ingress** — how a request that landed on node A reaches a replica on node C.
+3. **Record management** — who creates the A/AAAA/CNAME records, and how they stay true.
+4. **Internal discovery** — how a container addresses another app without leaving the fleet.
+
+Only (2) is architecturally interesting, and solving it well makes (1) and (3) almost
+trivial.
+
+### 10.1 The core decision: any node is a valid entry point
+
+**Every `vesta-proxy` holds the route table for the entire fleet, not just for the apps on
+its own host.** Upstreams are tagged with the node that owns them. If a request arrives for
+a hostname whose replicas live elsewhere, the receiving proxy forwards it to a peer proxy
+that has one.
+
+```
+ DNS: app.example.com ─▶ A 10.0.0.1, A 10.0.0.2, A 10.0.0.3
+
+    client ──▶ node2 :443            node2 has no replica of this app
+                 │  vesta-proxy: route table says replicas are on node1, node3
+                 │  TLS terminated here
+                 ▼  mesh hop: HTTP/2 over mTLS (node certs, internal CA), :8443
+              node3 :8443 ──▶ 172.20.0.11:3000   container, local to node3
+```
+
+Why this is worth the hop: **DNS no longer has to be correct about placement.** Point DNS
+at all your nodes, or one, or two edge boxes — routing stays correct in every case. Scaling
+an app from node1 to node3 touches no DNS record. A node dying doesn't produce a routing
+hole, only a resolution hole for the fraction of clients holding that IP.
+
+Mesh rules:
+
+- **Local-first.** A proxy always prefers ready upstreams on its own host and only forwards
+  when it has none. In the common case (small fleets, apps on every node) the hop never
+  happens and costs nothing.
+- **One hop, never two.** The forwarding proxy stamps `Vesta-Hop: 1`. A proxy receiving a
+  hopped request serves it locally or returns 503 — it must never forward again. This is
+  what makes loops structurally impossible rather than merely unlikely.
+- **mTLS between proxies**, using the node certificates the internal CA already issues
+  (§6.1). Inter-node traffic frequently crosses a public network between VPSes; it is never
+  plaintext, and no WireGuard or private-network requirement is imposed on the user.
+- **TLS terminates once**, at the entry node. The hop carries the original `Host`, the
+  client address in `X-Forwarded-For`, and the original scheme.
+- **Health is authoritative locally.** A proxy forwards only to peers reporting a ready
+  upstream in the last status tick, so a hop never lands on a known-dead node.
+
+Cost, stated plainly: one extra RTT (~0.3–1 ms same-datacenter, tens of ms cross-region)
+and doubled internal bandwidth for hopped requests. For cross-region fleets, pin an
+environment's placement to the region its DNS points at and the hop disappears.
+
+### 10.2 The four public-DNS shapes
+
+All four work identically, because §10.1 removed the requirement that DNS know where
+anything runs. This is a deployment choice, not an architecture fork.
+
+| Shape | Records | Failover behavior | Use when |
+|---|---|---|---|
+| **Single node** | one A (+ AAAA) | none | default; most installs |
+| **Multi-A round-robin** | one A per node, TTL 60 | client-side retry; optional health-checked record removal | small fleets, no extra infrastructure |
+| **Edge nodes** | A records for designated edge nodes only | mesh reaches compute nodes | separating ingress from compute; compute nodes need no public IP |
+| **Floating IP / external LB** | one A at a VIP, or the LB's hostname | sub-second (VRRP / cloud API / provider) | when real failover matters |
+
+**Multi-A is not failover, and we say so in the docs.** Browsers do retry the next A record
+on connection *refused* (Happy Eyeballs makes this fast), but a firewalled or blackholed
+node produces a TCP timeout instead, and clients sit through it. Resolvers and browsers
+also cache past TTL freely. If sub-minute failover is a requirement, the answer is a
+floating IP or an external load balancer — not a shorter TTL. Vesta will not pretend
+otherwise.
+
+### 10.3 Record management
+
+Three tiers, from zero-setup to fully automatic.
+
+**Zero-config (demos, local, first five minutes).** `sslip.io` / `nip.io` wildcards resolve
+without any DNS setup at all: `api-prod.10-0-0-1.sslip.io`. Enough to see the product work
+before touching a registrar.
+
+**Wildcard default domain (recommended).** The operator points `*.apps.example.com` at the
+node set **once**. Every app-environment then gets an automatic hostname
+(`<app>-<env>.apps.example.com`) with no further DNS work, ever. Combined with a single
+DNS-01 wildcard certificate shared through the cluster cert store (§9.4), adding an app
+involves zero DNS operations and zero ACME issuances. This is the path the onboarding flow
+pushes.
+
+**Custom domains.** `vesta domain add app.example.com --app api --env prod`. The UI shows
+the exact records to create, and then a **preflight check** resolves the hostname from the
+control plane and compares against the expected node addresses:
+
+```
+  app.example.com    A  10.0.0.1   ✓ node-1
+                     A  10.0.0.2   ✓ node-2
+                     A  198.51.100.7  ✗ unknown address — not a Vesta node
+  TTL 3600                          ⚠ shorten to 60 before changing node membership
+```
+
+Certificate issuance is **blocked** until preflight passes. ACME's failed-validation limit
+(5 per hostname per hour) means a misconfigured record otherwise locks a user out of TLS
+for an hour with an opaque error — the preflight check exists specifically to convert that
+into a clear message before any ACME traffic happens.
+
+**Provider automation (optional).** A `DNSProvider` interface backed by
+[`libdns`](https://github.com/libdns) — Cloudflare, Route53, DigitalOcean, Hetzner, Gandi,
+and the rest. One credential set, stored as an ordinary Vesta secret, serves **both**
+record management and DNS-01 challenges, because `certmagic` consumes the same `libdns`
+interfaces. With a provider configured, attaching a domain creates the record, detaching
+removes it, and adding a node updates every record that references the node set.
+
+Apex domains get an explicit note in the UI: the root of a zone cannot hold a CNAME, so it
+needs A/AAAA records or a provider-specific ALIAS/flattening feature.
+
+### 10.4 ACME interaction
+
+- **HTTP-01 with multiple A records** is the subtle case: the CA may hit *any* node. Because
+  all proxies share certificate storage through the control plane (§9.4), the challenge
+  token written by the solving node is immediately readable by every other node, so whichever
+  node the CA reaches can answer. Without shared storage this configuration fails
+  intermittently and inexplicably; with it, it just works.
+- **DNS-01** is required for wildcards and for nodes not reachable on :80. Challenges are
+  solved by the **control plane**, not the nodes, so provider credentials live in exactly one
+  place.
+- **Renewal** is cluster-wide and locked: one node renews, all nodes serve the result.
+
+### 10.5 Internal DNS
+
+**Inside one environment.** Containers on a user-defined bridge network resolve each other
+by container name through Docker's embedded resolver at `127.0.0.11`. Worth stating
+precisely because it is commonly misunderstood: setting `--dns` on a container does **not**
+replace the embedded resolver — it configures the *upstream* that `127.0.0.11` forwards
+unresolved queries to. Container-name resolution keeps working regardless.
+
+**Across environments, apps, and nodes.** The agent runs a small authoritative resolver
+bound to the bridge gateway address and sets it as the containers' upstream. It answers one
+zone:
+
+```
+  <app>.<env>.vesta.internal   →  the local vesta-proxy address
+```
+
+Everything else forwards to the host's configured resolvers. Traffic to
+`api.prod.vesta.internal` therefore reaches the local proxy, which applies §10.1: local
+replica if there is one, mesh hop if not. The consequences are the ones that matter:
+
+- Service links inject `http://api.prod.vesta.internal` rather than a public URL, so
+  east-west traffic never egresses to the internet and back.
+- The name is stable across redeploys, rescheduling, and scaling — it resolves to a proxy,
+  never to a container IP.
+- Cross-environment calls remain explicit and routable, while staying inside the fleet.
+
+**Ordering:** external DNS and the wildcard domain are M1 work; the proxy mesh and the
+internal resolver land with multi-node support in M7. A single-server install needs neither
+and pays for neither.
+
+## 11. Secrets pipeline
 
 The full path, end to end. Threat model is in [PLAN.md §6.1](PLAN.md); this is the
 mechanism.
@@ -690,7 +851,7 @@ A static, dependency-free binary (~2 MB, `CGO_ENABLED=0`). Correctness requireme
 
 ---
 
-## 11. Build pipeline
+## 12. Build pipeline
 
 ```
  git webhook / API / CLI
@@ -730,7 +891,7 @@ A static, dependency-free binary (~2 MB, `CGO_ENABLED=0`). Correctness requireme
 
 ---
 
-## 12. Data model
+## 13. Data model
 
 Sketch of the schema, sqlc-generated accessors, goose migrations. Postgres and SQLite
 share DDL except for type aliases.
@@ -769,7 +930,7 @@ Rules:
 
 ---
 
-## 13. Observability
+## 14. Observability
 
 **Logs.** The agent tails container stdout/stderr via the Docker API into a bounded
 per-container ring buffer on the host (immediately available for `vesta logs`, survives a
@@ -792,7 +953,7 @@ stated reason. Immutable, exportable, retained independently of the general even
 
 ---
 
-## 14. Failure modes
+## 15. Failure modes
 
 | Failure | Behavior | Recovery |
 |---|---|---|
@@ -802,13 +963,18 @@ stated reason. Immutable, exportable, retained independently of the general even
 | Proxy crashes | Traffic drops until systemd restarts it (~1 s). Containers unaffected. | Agent re-pushes config on proxy reconnect. |
 | dockerd down/hung | Reconcile passes time out per-app; agent reports `RuntimeUnavailable`; no cascading restarts. | Bounded contexts everywhere; agent recovers when the socket answers. |
 | Node unreachable | Marked unreachable after 3 missed heartbeats; its upstreams withdrawn from any other node's proxy; alert fires. Replicas are **not** rescheduled (v1). | Operator action. See PLAN §5.4. |
+| DNS still resolves to a dead node | Clients holding that A record fail to connect. Other nodes serve normally — routing is unaffected, only resolution. | Client retries the next A record on refused connections; with a DNS provider configured, the record is pulled automatically. Blackholed (timeout) nodes are the bad case — see §10.2. |
+| Mesh peer unreachable mid-request | Entry proxy returns 502 for that request and marks the peer down for subsequent ones. | Passive ejection with exponential re-admission; local upstreams are always preferred anyway. |
 | Deploy fails health gate | New replicas destroyed, old ones never left the pool, deployment marked `failed` with the failing probe output. | Automatic. Nothing to undo. |
 | Disk full on app server | Log rotation caps container logs; agent's ring buffers are bounded; image GC runs on a watermark. | Watermark-triggered prune of unreferenced images and stopped containers. |
 | Clock skew between CP and node | Spec ordering uses `Issued`; large skew could cause a Spec to be ignored. | Agent rejects Specs more than 5 min in the future and raises an event. |
+| Bad agent release | Workloads unaffected — containers are not children of the agent. The canary node fails to confirm and reverts to the previous binary. | Trial-and-revert (§17.6); the fleet rollout halts automatically, so only the canary was ever exposed. |
+| Agent too old to understand the current Spec | Connects, is marked `outdated`, refuses the Spec, and is offered an update over the frozen channel. | The Hello/Update messages never change incompatibly (§17.2), so no agent is ever unreachable. |
+| Migration fails mid-update | `vestad` aborts startup and does not serve; the previous binary can be restarted against the pre-migration backup. | Expand/contract means the prior release still reads the schema; SQLite is copied before migrating, Postgres uses an advisory lock. |
 
 ---
 
-## 15. Security boundaries
+## 16. Security boundaries
 
 ```
    internet ──▶ vesta-proxy    untrusted input, no secrets, unprivileged, own process
@@ -834,7 +1000,239 @@ stated reason. Immutable, exportable, retained independently of the general even
 
 ---
 
-## 16. Invariants
+## 17. Versioning and updates
+
+Updating a fleet is the operation with the worst failure mode in the whole system: a bad
+update can strand every node at once, and the thing you would use to fix them is the thing
+that just broke. The design is shaped around that single risk.
+
+### 17.1 One version, one commit
+
+`vestad`, `vesta-agent`, `vesta-proxy`, `vesta-init`, the CLI, and the embedded UI are built
+from one commit and share one version, `v0.7.3`. Independent per-component versions would
+produce a compatibility matrix nobody can test. Semver, with a specific meaning:
+
+| Bump | Means | Agent action |
+|---|---|---|
+| patch | bug fixes, no wire or schema change | auto-update by default |
+| minor | additive wire fields, additive migrations, new features | auto-update if policy allows |
+| major | a compatibility break — removed proto fields, destructive migration | never automatic |
+
+Each binary embeds, at build time:
+
+```go
+var (
+    Version         = "0.7.3"  // release
+    ProtocolVersion = 4        // wire contract, bumped independently of Version
+    MinPeerProtocol = 2        // oldest peer this binary will talk to
+)
+```
+
+`Version` is for humans. `ProtocolVersion` is what compatibility is actually decided on, and
+it moves far more slowly than `Version`.
+
+### 17.2 The frozen core
+
+**The update path must keep working when everything else has broken**, because it is the
+only way to repair a fleet remotely. So a small subset of the protocol is frozen at v1 and
+may never change incompatibly, no matter what happens above it:
+
+```protobuf
+// FROZEN. Additive-only, forever. Changing these breaks fleet recovery.
+message Hello       { string node_id = 1; string version = 2; uint32 protocol = 3;
+                      bytes agent_pubkey = 4; string applied_revision = 5; }
+message UpdateOffer { string version = 1; string sha256 = 2; bytes signature = 3;
+                      uint64 size = 4; bool required = 5; }
+message UpdateChunk { bytes data = 1; uint64 offset = 2; }
+message UpdateResult{ bool ok = 1; string version = 2; string error = 3; }
+```
+
+Everything else — `ApplySpec`, `Command`, `Event`, exec, logs — negotiates on
+`ProtocolVersion` and may evolve freely. The practical consequence: an agent too old to
+understand the current `Spec` can still say hello, be recognized, be told to update, and
+receive a new binary. **A stranded agent is always recoverable.** Without this rule, a
+protocol break means SSH-ing to every box, which is the failure we built the agent to avoid.
+
+### 17.3 Compatibility contract
+
+**The control plane may be newer than an agent. It is never older.** Update order is always
+control plane → agents → proxies, and the control plane supports agents for two minor
+versions back (roughly a quarter). Concretely:
+
+```
+  vestad 0.9.x  ←→  agent 0.7.x, 0.8.x, 0.9.x     supported
+  vestad 0.9.x  ←→  agent 0.6.x                    degraded: connects, refuses Spec,
+                                                    is offered an update immediately
+  vestad 0.7.x  ←→  agent 0.9.x                    refused — never run agents ahead of the CP
+```
+
+An out-of-contract agent is **not** disconnected. It connects, reports, appears in the fleet
+view marked `outdated`, and is offered an update. Refusing the connection outright would
+strand exactly the nodes that most need reaching.
+
+### 17.4 Updating the control plane
+
+1. Operator runs `vesta-update` (or pulls a new container image / systemd unit).
+2. `vestad` starts, acquires a migration lock (Postgres advisory lock; for SQLite, an
+   exclusive file lock plus an automatic pre-migration copy of `vesta.db`), and runs goose
+   migrations.
+3. Migrations follow **expand/contract**: the release that stops writing a column is never
+   the release that drops it. A column is added and populated in one release, stops being
+   read in the next, and is dropped in a third. This is what allows two `vestad` versions to
+   run against one database during an HA rolling update — and what makes a same-day rollback
+   of the binary possible without touching data.
+4. Agents reconnect on their own (§6.1 backoff). No agent action is required.
+
+**API downtime during a single-node CP update is seconds, and workloads are unaffected** —
+per §16, apps keep running, keep being health-checked, and keep being routed while the
+control plane is gone.
+
+**Downgrades are honest:** binaries roll back freely, schema does not. Migrations are
+forward-only. Rolling back across a migration boundary requires the pre-migration backup,
+and the release notes say so explicitly for any release that migrates.
+
+### 17.5 Updating an agent
+
+The property that makes this safe: **containers are children of `containerd-shim`, not of
+the agent.** Stopping, replacing, and restarting `vesta-agent` does not signal, stop, or
+touch a single running workload. There is no drain, no cordon, no eviction. This is the
+central advantage of not being Kubernetes, and it is why agent auto-update is a reasonable
+default here and a fraught one there.
+
+**Artifact delivery.** Two sources, same verification:
+
+- **Over the control stream** (default). The control plane holds the release artifacts and
+  streams the binary down the existing mTLS connection. No egress from app servers, no
+  registry credentials, no dependency on GitHub being up, and it works on nodes with no
+  internet access at all. Air-gapped installs do `vesta release import vesta-0.7.3.tar.gz`
+  on the control node once and the whole fleet updates from it.
+- **Direct download** from a configured URL, for operators who prefer a mirror.
+
+**Verification is a signature, not a checksum.** Every release artifact is signed with the
+project's Ed25519 release key; the public key is compiled into every agent binary. A SHA-256
+alone protects against corruption, not against a compromised mirror. Honest limit: this does
+not defend against a compromised control plane, which can already run arbitrary root
+containers on every node (PLAN §6.1, T4). It defends the distribution path, which is the
+part that is actually exposed.
+
+**Atomic swap and re-exec:**
+
+```
+1. stream artifact to /var/lib/vesta/bin/.agent.tmp   (same filesystem, so rename is atomic)
+2. verify Ed25519 signature and size; verify it runs: `.agent.tmp --version`
+3. hard-link current binary to agent.prev             (rollback target)
+4. write trial marker: /var/lib/vesta/update.trial {from, to, deadline}
+5. rename(.agent.tmp, agent)                          (atomic; no torn binary can be executed)
+6. exit(0) cleanly — systemd Restart=always starts the new one
+```
+
+### 17.6 Trial-and-revert
+
+Step 4 is what stops a bad release from bricking a fleet. The new agent must *prove itself*:
+
+```
+        new agent starts
+              │
+              ▼
+      trial marker present?
+         │            │
+        no           yes
+         │            │
+      normal          ▼
+      startup   deadline passed without a confirmed session?
+                   │                       │
+                  yes                      no
+                   │                       │
+                   ▼                       ▼
+          REVERT: rename(agent.prev,   connect to CP, apply a Spec,
+          agent); clear marker;        report healthy → clear marker,
+          exit → systemd restarts      update confirmed, delete agent.prev
+          the known-good binary
+```
+
+Confirmation requires an authenticated session *and* one successful reconcile pass — not
+merely "the process started". A binary that starts, connects, and then cannot converge is
+still a failed update, and it reverts.
+
+A reverted node reports `update-reverted` with the failing version, and the control plane
+**stops the rollout fleet-wide**. One node's failure cancels the update for everyone who
+hasn't taken it yet. This is the property that turns a bad release from a fleet-wide outage
+into a single-node blip.
+
+### 17.7 Rollout across the fleet
+
+Never all at once:
+
+```yaml
+update:
+  channel: stable          # stable | beta | edge
+  policy: patch            # patch | minor | manual | pinned
+  window: "Sun 02:00-06:00 Europe/Berlin"   # optional
+  rollout:
+    canary: 1              # nodes first
+    soak: 30m              # healthy before widening
+    batch: 25%             # then this fraction at a time
+    haltOnFailure: true    # any revert cancels the remainder
+  pinned:
+    - node: db-1           # never auto-updates; operator handles it
+```
+
+Defaults: `policy: patch`, one canary node, 30-minute soak, 25% batches, halt on failure.
+Security releases are flagged and surfaced loudly in the UI and via notification channels,
+but they **do not** override the policy — an auto-apply-security opt-in exists for operators
+who want it. A vendor-controlled switch that bypasses an operator's stated update policy is
+a supply-chain lever, and we don't build one.
+
+### 17.8 Updating the proxy — without dropping traffic
+
+The agent owns the proxy binary's lifecycle. A naive restart costs ~1 s of refused
+connections, which would make proxy updates user-visible. Instead the listening socket is
+owned by systemd (`vesta-proxy.socket`) and passed in as a file descriptor:
+
+```
+  systemd holds :80/:443 listeners
+        │ fd passed to
+        ▼
+   vesta-proxy (old) ──stop──▶ drains in-flight requests, exits
+        │                                    ▲
+        └── vesta-proxy (new) starts, ───────┘ inherits the same listeners
+            accepts immediately
+```
+
+The socket is never closed, so nothing is refused; the old process finishes its in-flight
+requests while the new one accepts. Same mechanism as a config reload, but with a new
+binary. On systems without socket activation, the fallback is `SO_REUSEPORT` with an overlap
+window.
+
+### 17.9 Updating `vesta-init`
+
+`vesta-init` is bind-mounted into every running container, so it cannot be replaced in place
+in a way that affects them — and shouldn't be. It is written to a **versioned path**:
+
+```
+/var/lib/vesta/bin/vesta-init-0.7.3     mounted as /.vesta/init in containers created by 0.7.3
+/var/lib/vesta/bin/vesta-init-0.7.1     retained while any running container references it
+```
+
+Running containers keep the exact binary they started with. A new `vesta-init` reaches a
+workload only through an ordinary container replacement, which means it flows through the
+rollout machinery in §8 with health gates and automatic rollback — the same path as any
+other change. Old versions are garbage-collected when no container references them.
+
+### 17.10 CLI and version skew
+
+`vesta self-update` updates the CLI, verifying the same signature. The CLI warns — and does
+not block — when its minor version differs from the control plane's, because an operator on
+a slightly old laptop is normal and should not be a wall.
+
+### 17.11 Visibility
+
+`vesta version --fleet` and the fleet view show, per node: agent version, protocol version,
+update policy, last update, and whether it reverted. Version drift is highlighted rather
+than hidden, because an un-updated node is usually the one with a problem — a full disk, a
+clock skew, a systemd unit someone edited by hand.
+
+## 18. Invariants
 
 Testable statements. A change that breaks one of these is a bug, and each has a
 corresponding test.
@@ -850,13 +1248,21 @@ corresponding test.
 7. A Release's image digest never changes after creation.
 8. The agent applies Specs in `Issued` order and never regresses.
 9. Every state mutation emits exactly one event to the internal bus.
-10. Killing the control plane mid-deploy leaves the environment either fully on the old
+10. A request is forwarded across the mesh at most once; a proxy receiving a request
+    carrying `Vesta-Hop` serves it locally or fails, and never forwards.
+11. Certificate issuance for a hostname is never attempted before its DNS preflight passes.
+12. An agent update never signals, stops, or restarts a running container.
+13. An agent binary is only executed after its Ed25519 signature verifies; a partially
+    downloaded artifact can never be executed, because the swap is a `rename()`.
+14. An agent that fails to confirm within its trial deadline reverts to the previous
+    binary without operator action, and halts the rollout for the rest of the fleet.
+15. Killing the control plane mid-deploy leaves the environment either fully on the old
     release or fully on the new one, never split — because the agent completes or rolls
     back the pass it started.
 
 ---
 
-## 17. Extension points
+## 19. Extension points
 
 - **Runtime** — `dockerx` is the only Moby importer. containerd/Podman is a sibling
   package satisfying the same interface.

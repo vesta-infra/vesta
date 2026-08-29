@@ -492,12 +492,19 @@ backups to S3-compatible storage with restore drills, cron jobs, one-shot jobs, 
 limits, quotas, notifications, maintenance mode.
 
 **M7 — Fleet and polish (week 17–19)**
-Multi-server placement and constraints, spread/binpack, fleet dashboard, metrics, OTLP,
-audit UI, `install.sh`, docs, migration importer that reads a Coolify install and produces
-Vesta projects/apps/environments.
+Multi-server placement and constraints, spread/binpack, proxy mesh and internal DNS
+resolver, fleet dashboard, metrics, OTLP, audit UI, `install.sh`, docs, migration importer
+that reads a Coolify install and produces Vesta projects/apps/environments.
+
+Also **signed releases and agent auto-update** (ARCHITECTURE §17). This moved forward from
+post-v1: the moment a fleet exists, hand-updating every node is untenable, and the frozen
+update channel has to be in the protocol from the first release that ships to anyone —
+retrofitting a recovery path into an already-deployed fleet means SSH-ing to every box,
+which is the failure the agent exists to prevent. Acceptance: push a bad release to a
+canary node and watch it revert itself and halt the rollout, with zero container restarts.
 
 **Post-v1:** opt-in node failover, canary with metric gates, external secret stores
-(Vault, AWS SM) as a `SecretProvider` backend, addon/template marketplace, agent auto-update.
+(Vault, AWS SM) as a `SecretProvider` backend, addon/template marketplace.
 
 ---
 
