@@ -923,6 +923,11 @@ Rules:
   in a handler cannot leak cross-tenant data.
 - `secret_versions` is append-only. Deleting a secret tombstones it; the ciphertext is
   destroyed only after no live Release references the version.
+- **There is no `ssh_keys` table, and adding one is an architectural change, not a
+  feature.** Node access is by short-lived certificate; nothing in this schema grants a
+  shell on anything. The legacy Rust schema had `ssh-key.entity.ts` because it drove
+  servers over SSH; porting it would reintroduce the skeleton-key problem (PLAN §1.4) that
+  the transport design exists to eliminate.
 - `instances` is a *cache* of agent-reported state, never a source of truth. If it
   disagrees with an agent, the agent is right.
 - `events` is the append-only projection source for the UI stream and webhooks;
@@ -991,6 +996,19 @@ stated reason. Immutable, exportable, retained independently of the general even
 
 - The agent listens on **no** network port. Its only inbound surface is a root-owned unix
   socket. Everything reaches it through a connection it opened.
+- **The control plane stores no SSH keys and holds no standing access to any node.** There
+  is no `ssh_keys` table, no encrypted key blob, no credential of any kind that grants a
+  shell. This is a direct consequence of the agent dialing out (§6.1): a system that never
+  initiates a connection needs nothing to authenticate with. The legacy Rust schema's
+  `ssh-key.entity.ts` is deliberately **not** ported (§13).
+- Assisted bootstrap, if used, receives a key for the duration of one call and never writes
+  it. A control plane that has enrolled a hundred nodes contains exactly as much SSH key
+  material as one that has enrolled none.
+- Consequently, a full offline compromise of the control plane — stolen backup, leaked disk
+  image, exfiltrated key file — yields **no** route to any app server. Live compromise is a
+  different matter and is addressed honestly in PLAN §6.1 (T4): the attacker can publish a
+  Spec, which is root by another road, but only through an audited channel and only until
+  the CA is rotated.
 - The proxy never holds, requests, or is told about secret material.
 - Container-to-container isolation is Docker's, which means it is a boundary against
   accident, not against a determined hostile tenant. Stated plainly in the docs.
@@ -1251,12 +1269,15 @@ corresponding test.
 10. A request is forwarded across the mesh at most once; a proxy receiving a request
     carrying `Vesta-Hop` serves it locally or fails, and never forwards.
 11. Certificate issuance for a hostname is never attempted before its DNS preflight passes.
-12. An agent update never signals, stops, or restarts a running container.
-13. An agent binary is only executed after its Ed25519 signature verifies; a partially
+12. The control plane never persists an SSH private key, or any other credential granting
+    shell access to a node — verified by a schema assertion and a test that greps the
+    store layer, so the property cannot be lost to a well-meaning feature PR.
+13. An agent update never signals, stops, or restarts a running container.
+14. An agent binary is only executed after its Ed25519 signature verifies; a partially
     downloaded artifact can never be executed, because the swap is a `rename()`.
-14. An agent that fails to confirm within its trial deadline reverts to the previous
+15. An agent that fails to confirm within its trial deadline reverts to the previous
     binary without operator action, and halts the rollout for the rest of the fleet.
-15. Killing the control plane mid-deploy leaves the environment either fully on the old
+16. Killing the control plane mid-deploy leaves the environment either fully on the old
     release or fully on the new one, never split — because the agent completes or rolls
     back the pass it started.
 

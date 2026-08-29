@@ -18,7 +18,7 @@ retired (§9).
 
 ## 1. Why this exists
 
-Coolify proved the market: people want Heroku on a $12 Hetzner box. It has three
+Coolify proved the market: people want Heroku on a $12 Hetzner box. It has four
 structural problems we are building around, not incremental gripes.
 
 ### 1.1 It is slow
@@ -71,6 +71,41 @@ promotion moves an image digest, not source. And replicas are first-class per se
 N containers behind a health-aware load balancer, rolling/blue-green/canary, on a single
 box or spread across a fleet.
 
+### 1.4 The control plane is a skeleton key
+
+Coolify reaches servers over SSH, which means it must **store a private key with root
+access to every server in the fleet**, at rest, indefinitely. That makes the control plane
+the single most valuable target in the estate: compromise the panel and you have not just
+the panel, you have interactive root on every machine it manages — and, because operators
+routinely reuse one key, often on machines it doesn't. The credential outlives the
+incident: an attacker who exfiltrates that key keeps root after the panel is rebuilt, and
+nothing about their SSH sessions appears in the platform's audit log.
+
+**Our position: Vesta stores no SSH keys, because the control plane never initiates a
+connection.** Agents dial out and authenticate with short-lived certificates from an
+internal CA. There is no key material on the control plane to steal, no long-lived
+credential that survives remediation, and no reason for port 22 to be open to the world on
+any app server — they can sit behind NAT, on a private network, or on Tailscale, with no
+inbound rule at all.
+
+This is a real reduction, and it is worth being precise about its limits, because
+overclaiming here is easy. A compromised control plane is still *very bad*: it can publish
+a Spec that runs a privileged container, which is root on every node by another route. What
+changes is the character of the compromise, and each difference matters on its own:
+
+| | SSH-based panel | Vesta |
+|---|---|---|
+| Credential at rest | root private key, indefinite | none |
+| Survives remediation | yes — key still works after rebuild | no — certs are short-lived and re-issued |
+| Access shape | interactive shell, arbitrary | publish a Spec; that is the whole API |
+| Visibility | SSH sessions invisible to the platform | every Spec and deployment is an audited event |
+| Reaches non-Vesta hosts | yes, if the key is reused | no |
+| Requires port 22 open | usually | never |
+
+So: not "a compromised control plane is harmless" — it isn't — but "there is no stored
+skeleton key, the attacker must act through an audited channel, and they lose access when
+you rotate." See §6.1 (T4) for how this sits in the full threat model.
+
 ---
 
 ## 2. Goals and non-goals
@@ -81,6 +116,9 @@ box or spread across a fleet.
 - Multiple replicas per server, zero-downtime rolling deploys, on a one-server install.
 - One app, many environments, with inheritance, diff, and promote-by-digest.
 - Secrets that survive a hostile `docker inspect` and a leaked database backup.
+- **No SSH key material anywhere in the platform.** Agents dial out with short-lived
+  certificates; app servers need no inbound port, and the control plane holds nothing that
+  grants standing root access to anything.
 - Managed databases, backups, cron, one-shot jobs, logs, exec — parity with Coolify's
   useful surface.
 - Single binary per component. `curl | sh` install. No Redis, no queue broker, no PHP.
@@ -210,8 +248,14 @@ the agent posts the token, receives a client certificate from `vestad`'s interna
 dials the stream. Certs auto-renew over the established stream. No SSH key on the control
 plane, no inbound firewall rule on the app server, no port 22 dependency.
 
-For servers where the user wants us to do the bootstrap, `vestad` will SSH **once** to run
-the install script, and then never again. SSH is a provisioning tool here, not a transport.
+For servers where the user wants us to do the bootstrap, `vestad` can SSH **once** to run
+the install script, and then never again — SSH is a provisioning tool here, not a
+transport. The key is supplied for that single call, held in memory for its duration, and
+**never persisted**: there is no `ssh_keys` table in the schema, no encrypted key blob, and
+nothing for an attacker to recover from the control plane afterwards. Assisted bootstrap is
+therefore an operation the operator authorizes once, not a standing capability the platform
+retains. The default install path doesn't use it at all: the operator runs the one-line
+install script themselves and the agent enrolls itself.
 
 ---
 
@@ -284,7 +328,8 @@ threat model is marketing.
 | T1 | Non-root shell on an app server, `docker` group | **Yes** — nothing in `docker inspect`, nothing in container config, nothing on disk |
 | T2 | Read access to control-plane disk, no process access | **Yes** with external KMS or sealed mode |
 | T3 | Root on an app server, live | **Partially** — see below |
-| T4 | Root on the control plane, live | **No.** Compromise of `vestad` is game over |
+| T4 | Root on the control plane, live | **No** for live secrets — but see below: no stored SSH key, no persistence after remediation |
+| T5 | Attacker who stole a control-plane backup or key file *offline* | **Yes** — there is no credential in it that grants access to any app server |
 
 **On T3, honestly:** root on a Linux box can read `/proc/<pid>/environ`, `nsenter` into a
 container, and ptrace a running process. No user-space design changes that. What we do
@@ -293,6 +338,21 @@ running on server A*, only while they run, with no at-rest copy to exfiltrate la
 key material to reuse elsewhere. Compare with Coolify, where the same access yields every
 secret for every app, at rest, forever. Anyone claiming to defend T3 without a TPM or a
 confidential-computing enclave is selling something.
+
+**On T4, precisely:** an attacker with live root on `vestad` can decrypt secrets as they
+pass through, and can publish a Spec that runs a privileged container — which is root on
+every node by a second route. We do not claim otherwise. What is *absent* is the thing that
+usually makes this catastrophe permanent: **there is no stored credential.** No SSH private
+key, no long-lived agent token, no password for anything. Access is by short-lived
+certificate issued by the internal CA, so revoking the CA and re-enrolling nodes ends it —
+whereas an exfiltrated SSH key keeps working after you have rebuilt the panel, and keeps
+working on every other host that trusts it. The attacker also cannot act quietly: the only
+lever they have is publishing Specs, and every Spec, deployment, and secret access is an
+audited event with an actor attached. §1.4 has the comparison in full.
+
+This is also why T5 is a distinct row. Offline compromise — a stolen backup, a leaked disk
+image, a misplaced key file — yields ciphertext and no route to any app server. In an
+SSH-based design the same artifact contains the key to the entire fleet.
 
 ### 6.2 Key hierarchy
 
