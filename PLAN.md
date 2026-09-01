@@ -379,8 +379,12 @@ KEK  (root key — file | env | AWS KMS | GCP KMS | Vault Transit | sealed/Shami
 The AAD binding matters: a ciphertext lifted from one app's row and pasted into another's
 fails to decrypt. Copy-paste privilege escalation inside the database is closed.
 
-`vestad` supports **sealed mode** (Vault's model): the KEK is never on disk; on boot the
-process starts sealed and refuses secret operations until unsealed with Shamir shares.
+`vestad` **auto-unseals by default** from a KMS (AWS, GCP, or Vault Transit) where one is
+reachable, falling back to a `0600` key file otherwise. Manual **sealed mode** — Vault's
+model, where the KEK is never on disk and Shamir shares are entered on each boot — is opt-in.
+Auto-unseal is the default because a control plane that needs a human after every restart is
+one that solo operators disable outright, and a posture nobody runs protects nothing
+(ARCHITECTURE §11.1).
 Costs an operator step after every restart, defeats T2 completely. Default install uses a
 key file with `0600` and a loud recommendation to move to KMS.
 
@@ -660,9 +664,11 @@ canary node and watch it revert itself and halt the rollout, with zero container
    Stateless apps, which are most of them, were never constrained by this. What remains open
    is narrower: which filesystems we support for Replicated send/receive beyond ZFS and
    btrfs, and whether snapshot-plus-rsync is good enough as the fallback.
-2. **Sealed mode ergonomics.** Requiring an unseal after every control-plane restart will
-   annoy solo operators into disabling it. Is auto-unseal via a cloud KMS the real default,
-   with Shamir as the paranoid option?
+2. ~~**Sealed mode ergonomics.**~~ **Resolved** (ARCHITECTURE §11.1). KMS auto-unseal is the
+   default where a KMS is reachable, a `0600` file KEK is the fallback, and Shamir manual
+   unseal is opt-in. Auto-unseal moves the trust anchor off the disk — defending a stolen
+   backup or disk image — at no availability cost; neither it nor Shamir defends live root on
+   the control plane, and the docs say so rather than implying otherwise.
 3. ~~**Coolify importer fidelity.**~~ **Resolved** (ARCHITECTURE §18.3). Structure, domains,
    volumes, schedules and plaintext config import; **secret values do not**. Vesta will not
    ask for Coolify's `APP_KEY`, and no code path exists that would accept it — a decrypting

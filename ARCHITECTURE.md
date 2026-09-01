@@ -1310,6 +1310,49 @@ apps may use a secret is an authorization question, answered by bindings and ACL
 §11.6), not by encryption — conflating the two would mean either no sharing or an ACL system
 you cannot change without re-encrypting.
 
+
+#### KEK sources, and why auto-unseal is the default
+
+```
+  KMS auto-unseal   AWS KMS · GCP KMS · Vault Transit   ← DEFAULT where reachable
+  File KEK          0600 on the control node             ← fallback default
+  Shamir manual     split shares, entered on each boot   ← opt-in
+```
+
+**Auto-unseal is the default deliberately, and the reasoning is about who actually runs
+this.** A control plane that demands a human after every restart gets restarted at 03:00 by a
+kernel update, and stays down until someone wakes. The solo operators who are most of Vesta's
+users respond to that by turning sealing off entirely — so a "secure by default" that costs
+availability produces a *less* protected fleet than a pragmatic one. Vault learned this; we
+start where it ended up.
+
+What each source actually defends, without overstatement:
+
+| | Offline disk theft (T2) | Live root on the control plane (T4) |
+|---|---|---|
+| **KMS auto-unseal** | **yes** — no key material on disk; an attacker needs the database *and* live KMS credentials | no — a live process can simply ask the KMS |
+| **File KEK** | no — the key is on the same disk as the data it protects | no |
+| **Shamir manual** | **yes**, most strongly — the key exists only in operator memory between boots | no |
+
+So auto-unseal gives most of Shamir's benefit at none of its operational cost: it moves the
+trust anchor off the disk and into a system with its own audit trail and revocation. What it
+does not do — and Shamir does not do either — is protect against an adversary who already has
+the running process. That is T4, and PLAN §6.1 says plainly what T4 costs.
+
+The file KEK is the fallback when no KMS is configured, and it is honest about being one: it
+protects a stolen *database backup*, which is the common incident, and not a stolen *disk
+image*, which is rarer. The setup flow says so at the moment of choosing, and recommends KMS.
+
+**Sealed-mode behavior, when chosen.** A manually sealed `vestad` that restarts comes back
+**sealed but running**: the API serves, the UI loads and says so, and every operation that
+needs a secret is refused with a clear message. Running workloads are unaffected (§21) —
+they keep serving, health-checked and routed — but no new deployment can obtain secrets until
+someone unseals. That degraded state is legible on purpose, so the failure reads as "sealed,
+needs unsealing" rather than as an outage of unclear cause.
+
+`vesta reseal` exists for incident response: reseal immediately, then rotate. Sealing is not
+only a boot-time posture.
+
 ### 11.2 Sealing to a node
 
 At spec-generation time, for each (node, app-env) that needs secrets:
