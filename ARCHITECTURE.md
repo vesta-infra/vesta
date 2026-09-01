@@ -388,7 +388,7 @@ type AppSpec struct {
     WorkDir     string
     User        string
 
-    Env         map[string]string // NON-SECRET only. Secrets never appear here.
+    EnvVars     map[string]string // NON-SECRET only. Secrets never appear here.
     SecretRef   string            // bundle id in Spec.Secrets
     SecretsVer  int               // bump forces a rolling restart
 
@@ -1610,7 +1610,7 @@ token. Values exist only in the process's memory, never in any filesystem.
 
 ### 11.4 `vesta-init` details
 
-A static, dependency-free binary (~2 MB, `CGO_ENABLED=0`). Correctness requirements:
+A static, dependency-free binary (~3 MB, `CGO_ENABLED=0`). Correctness requirements:
 
 - It **`execve`s**, so it does not remain as a wrapper: the real app is PID 1, signals go
   straight to it, exit codes pass through unmodified, and there is no zombie-reaping
@@ -1913,7 +1913,7 @@ type JobSpec struct {
     Image    string         // digest, pinned at spec generation
     Command  []string
 
-    Env        map[string]string
+    EnvVars    map[string]string
     SecretRef  string       // same sealed-bundle path as an app (§11)
     SecretsVer int
     Resources  Resources    // mandatory, not optional — see §13.7
