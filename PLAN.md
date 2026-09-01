@@ -470,7 +470,7 @@ notifications, webhooks (HMAC-signed), audit, resource limits, team quotas, temp
 ## 8. Repo layout
 
 ```
-vesta/
+vesta/                       module getvesta.sh
 ├── cmd/
 │   ├── vestad/          control plane (API + UI + scheduler + store)
 │   ├── vesta-agent/     node agent
@@ -495,8 +495,14 @@ vesta/
 └── PLAN.md
 ```
 
-Single Go module. `CGO_ENABLED=0`. `make build` produces five static binaries for
-linux/amd64 and linux/arm64.
+Single Go module, path **`getvesta.sh`** — so imports read `getvesta.sh/internal/reconcile`.
+The bare domain goes to this edition and the Kubernetes edition keeps
+`kubernetes.getvesta.sh/*`, which makes the import path itself say which is the product and
+which is the edition. Deliberately not named after the runtime: §25 makes containerd and
+Podman explicit extension points, so a path containing `docker` would be wrong within a year.
+
+`CGO_ENABLED=0`. `make build` produces five static binaries for linux/amd64 and
+linux/arm64.
 
 ---
 
@@ -532,7 +538,8 @@ grepping for a while. Nothing in it ships.
 Each milestone ends with something demonstrable, not a layer.
 
 **M0 — Skeleton (week 1–2)**
-Go module, five `cmd/` binaries, gRPC contracts, agent enrollment with mTLS, store with
+Serve the `go-import` meta tag at `getvesta.sh` first — everything else imports through it.
+Then: Go module `getvesta.sh`, five `cmd/` binaries, gRPC contracts, agent enrollment with mTLS, store with
 migrations, `vesta server add` works end to end. Acceptance: a fresh VPS shows up in the
 fleet view within 60 seconds of one curl command.
 
@@ -667,10 +674,9 @@ canary node and watch it revert itself and halt the rollout, with zero container
 4. **Single-binary control plane vs. containerized.** Shipping `vestad` as a systemd unit
    is faster and lighter; shipping it as a container is what everyone expects. Probably
    both, with systemd as the documented default.
-5. **Two editions, one name.** Naming is settled — this is Vesta, `vesta-kubernetes` is the
-   Kubernetes edition — but the consequences are not. Open: does the Go module path become
-   `getvesta.sh/vesta` (with the existing `kubernetes.getvesta.sh/*` left alone), do the two
-   editions share a version number and release cadence or drift independently, and does the
-   CLI stay a single `vesta` binary that detects its backend or ship as two? Recommendation:
-   independent versions, one CLI with a `--context` that points at either control plane,
-   since the verbs are identical by design.
+5. ~~**Two editions, one name.**~~ **Resolved.** Module path is `getvesta.sh` (§8); the
+   editions version and release **independently** (ARCHITECTURE §23.1); and the CLI is **one
+   binary** addressing both through contexts (§2.3) — which avoids a collision rather than
+   creating a shared surface, since the Kubernetes edition's CLI is already called `vesta`.
+   Remaining prerequisite, not a question: the `go-import` meta tag must be served at
+   `getvesta.sh` before M0, as it already is for `kubernetes.getvesta.sh`.

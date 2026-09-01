@@ -125,6 +125,45 @@ survive unless `--purge` is passed, because the destructive default here is unre
 **Air-gapped installs** side-load binaries from a bundle and enroll normally; the join token
 travels over the control plane connection, which is the only network path required.
 
+### 2.3 The CLI and contexts
+
+**One `vesta` binary addresses both editions.** This is less a convenience than an avoided
+collision: the Kubernetes edition's CLI is already named `vesta`, and shipping a second
+binary under the same name would mean owning "which `vesta` is on your PATH?" as a support
+question indefinitely.
+
+Contexts work the way `kubectl`'s do — `~/.vesta/config`, one entry per control plane:
+
+```yaml
+contexts:
+  - name: hetzner
+    endpoint: https://vesta.example.com
+    edition: docker          # this edition
+    auth: { token: <keyring reference> }
+  - name: prod-k8s
+    endpoint: https://k8s.getvesta.sh
+    edition: kubernetes
+current: hetzner
+```
+
+```
+vesta deploy api --env production                  # current context
+vesta --context prod-k8s deploy api --env production   # identical verb, other substrate
+```
+
+Because the two editions share a product model by design, most verbs — `deploy`, `promote`,
+`logs`, `secret`, `scale`, `rollback` — work unchanged against either. Verbs that only make
+sense for one resolve from the context's `edition` and fail with a specific message
+(`server add is not available for a Kubernetes context; use kubectl or the Vesta Kubernetes
+chart`) rather than an obscure API error.
+
+Tokens are held in the OS keyring where one exists and in a `0600` file otherwise; the
+config file itself stores a reference, never a credential, so it can be committed to a
+dotfiles repo without incident.
+
+The Kubernetes edition's CLI keeps shipping as it is until this binary reaches parity;
+users are moved by replacing one with the other, not by learning a second tool.
+
 ---
 
 ## 3. The Spec — the central contract
@@ -3005,8 +3044,14 @@ that just broke. The design is shaped around that single risk.
 
 ### 23.1 One version, one commit
 
-`vestad`, `vesta-agent`, `vesta-proxy`, `vesta-init`, the CLI, and the embedded UI are built
-from one commit and share one version, `v0.7.3`. Independent per-component versions would
+`vestad`, `vesta-agent`, `vesta-proxy`, `vesta-init`, and the embedded UI are built from one
+commit and share one version, `v0.7.3`.
+
+**This rule is within an edition.** Vesta and Vesta Kubernetes version and release
+independently — a shared number would force one to cut empty releases whenever the other
+shipped, and they are at very different maturities. The CLI is versioned with this edition
+but supports both (§2.3), so its compatibility is stated against each control plane rather
+than assumed from a matching number. Independent per-component versions would
 produce a compatibility matrix nobody can test. Semver, with a specific meaning:
 
 | Bump | Means | Agent action |
