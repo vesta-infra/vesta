@@ -82,6 +82,49 @@ deliberately stripped of `Secrets` before it is persisted. On a cold boot the ag
 reconstruct containers but must re-obtain secrets from the control plane. That is a
 deliberate availability-for-confidentiality trade (§21).
 
+### 2.2 Installation and enrollment
+
+**Control plane.** One script, systemd unit by default. First run generates the internal CA,
+establishes the KEK (file, or a prompt for KMS/sealed mode, §11.1), runs migrations, and
+prints a **single-use setup token to the console**.
+
+That token is the whole of the first-run security model, and it exists because the
+alternative is worse: a setup page where the first visitor becomes administrator is a
+well-worn way for self-hosted software to hand an unattended installation to whoever scans
+port 443 first. The token is printed where only someone with shell access sees it, expires in
+15 minutes, and is single-use. There is no window in which an unclaimed control plane is
+claimable from the network.
+
+**Nodes.** `vesta server add` mints a join token — single-use, expiring (default 1 h),
+revocable, scoped to one node. The operator runs the printed one-liner on the server:
+
+```
+curl -fsSL https://<control-plane>/install.sh | VESTA_TOKEN=<token> sh
+```
+
+The script detects OS and architecture, downloads the agent and proxy, **verifies the Ed25519
+release signature** with the same key used for updates (§23.5), installs the systemd units,
+and starts the agent — which posts the token, receives a client certificate from the internal
+CA, and dials the control stream (§6.1). The CA issues no certificate without a valid,
+unused, unexpired token.
+
+**Preflight runs before anything is written**, and fails with specifics rather than leaving a
+half-installed node: Docker present and a supported version; cgroup v2; sufficient disk;
+ports 80/443 free or already ours; clock within tolerance of the control plane (§21). "Docker
+20.10 found, 24.0 or newer required" is a fixable message; a partially installed agent that
+never connects is not.
+
+**Re-running the installer repairs rather than duplicates.** It is idempotent by design,
+because the realistic operator response to a half-failed install is to run it again.
+
+**Removal** is `vesta server remove`: the node is drained (workloads rescheduled where policy
+allows, §5), the agent deregisters, its certificate is revoked, and the uninstall script
+removes the units. It says explicitly what it does *not* remove — volumes and their data
+survive unless `--purge` is passed, because the destructive default here is unrecoverable.
+
+**Air-gapped installs** side-load binaries from a bundle and enroll normally; the join token
+travels over the control plane connection, which is the only network path required.
+
 ---
 
 ## 3. The Spec — the central contract
@@ -405,6 +448,52 @@ internal/buildd      BuildKit client, cache, image push
 `dockerx` is the only package that imports the Moby SDK. Everything above it speaks
 `core` types. This is what makes a future containerd or Podman backend a new package
 rather than a rewrite.
+
+### 6.5 Interactive sessions: exec
+
+A shell inside a running container, from the browser or the CLI, over a transport where the
+control plane cannot dial anything (§6.1).
+
+```
+browser ──WS──▶ vestad ──control stream──▶ agent: "open an exec stream, token T"
+                   ▲                          │
+                   │                          ▼  agent dials back
+                   └────── Exec bidi RPC ─────┴──▶ docker exec attach ──▶ container
+```
+
+The agent initiates, as with logs. The token is single-use, short-lived, and bound to one
+container and one command.
+
+**Authorization: exec is equivalent to reading every secret the container holds.** A shell in
+a container can print its own environment. So `exec` is a distinct permission, never implied
+by deploy rights, and on production environments it requires re-authentication — the same
+treatment as `reveal` on a secret (§11.5), for the same reason. Any design that lets a
+Developer who cannot read `STRIPE_SECRET_KEY` open a shell in the container holding it has
+not restricted anything; it has only added a step.
+
+**Every session is audited**: actor, container, release, command, start and end, and source
+IP. Optional **session recording** captures the full I/O stream in asciinema-compatible form,
+retained per policy — the compliance feature, with a stated caveat that recordings capture
+whatever is typed, including credentials pasted into a shell, so recording storage inherits
+the same access controls as secrets.
+
+Mechanics that decide whether it works:
+
+- **TTY vs. no TTY.** With a TTY the stream is raw; without one it is `stdcopy`-framed, the
+  same trap as logs (§20.3). Resize events are forwarded so a browser terminal's dimensions
+  reach the process.
+- **Orphan prevention.** If the WebSocket dies, the exec process is killed. Without this,
+  abandoned browser tabs accumulate shells holding file handles and memory on production
+  nodes.
+- **Bounded.** Idle timeout, maximum session duration, and a cap on concurrent sessions per
+  node and per user. An exec session is not a replica and receives no traffic.
+- **Debug containers for images with no shell.** A `scratch` or distroless image has nothing
+  to exec into. `vesta debug` starts an ephemeral container sharing the target's PID, network,
+  and mount namespaces, carrying a toolbox image. This is why building minimal images does not
+  have to mean losing the ability to inspect them — and it is the only supported way to get a
+  shell "into" a container that never had one.
+- **Parked apps** (§14.3) are not woken by an exec attempt. The choice is offered explicitly:
+  wake the app, or attach a debug container to the stopped one's filesystem.
 
 ---
 
@@ -817,6 +906,43 @@ control-plane outage cannot break TLS termination.
 
 HTTP-01 challenges are routed to whichever node holds the lock; DNS-01 is supported for
 wildcards and for nodes that aren't publicly reachable on :80.
+
+### 9.5 Maintenance mode
+
+Maintenance mode is enforced **at the proxy**, which is the property that makes it useful:
+turning it on restarts nothing, changes no container, and can be turned off just as fast. The
+application is not down — it is shielded.
+
+Per environment, and optionally per route:
+
+```go
+type Maintenance struct {
+    Active    bool
+    Status    int      // default 503
+    RetryAfter time.Duration
+    Page      string   // custom HTML, served from proxy memory — no upstream needed
+    AllowCIDR []string // operators fixing the thing
+    BypassCookie string // signed; lets a named person through a public network
+    Until     time.Time // scheduled windows
+}
+```
+
+Four details that separate this from returning 503 from the app:
+
+- **The people fixing it can still reach it.** A CIDR allowlist and a signed bypass cookie
+  mean maintenance mode does not lock out the team debugging behind it.
+- **ACME challenge paths stay open.** `/.well-known/acme-challenge/` is never intercepted.
+  Certificate renewal during a long maintenance window otherwise fails silently and surfaces
+  days later as an expired certificate — a genuinely nasty compound failure.
+- **Probes keep running and alerts are suppressed** for the environment while it is active, so
+  a planned window does not page anyone. Suppression has a **maximum duration**: a maintenance
+  mode someone forgot to turn off must not silence alerting indefinitely, so it expires and
+  starts alerting about *itself*.
+- **Automatic activation** for operations that require it — a managed-database major upgrade
+  (§15.2) sets and clears it around the cutover, so the window is exactly as long as the
+  operation and no longer.
+
+Scheduled windows announce themselves through notification channels (§20.13) in advance.
 
 ---
 
@@ -1406,6 +1532,50 @@ access. For air-gapped installs the cache is pre-warmed by `vesta image import`,
 also how the update artifacts arrive (§23.5) — one mechanism, two uses.
 
 
+### 12.2 Git providers and push-to-deploy
+
+Supported: GitHub, GitLab, Gitea/Forgejo, Bitbucket — hosted and self-hosted.
+
+**GitHub App, not a personal access token.** A PAT is bound to a person, carries their full
+scope, and stops working the day they leave. An App installation is scoped to chosen
+repositories, issues short-lived tokens, and survives staff changes. The same reasoning
+applies to GitLab and Gitea where an equivalent exists; PATs remain available for
+installations that cannot use an App, stored as secrets (§11.6).
+
+**Webhook ingestion is the one unauthenticated endpoint in the system**, so it is treated
+accordingly: per-provider HMAC signature verification, a timestamp window to bound replay,
+and deduplication by delivery id. Nothing in the payload is trusted for authorization —
+the repository is matched against a configured installation rather than taken from the body,
+because otherwise anyone who can forge a payload chooses which app to deploy.
+
+**Event mapping** is configuration, not convention:
+
+| Event | Default behavior |
+|---|---|
+| push to a mapped branch | build → release → deploy to that environment |
+| tag matching a pattern | build → release, deploy per policy (approval gate for production) |
+| PR opened / synchronized | create or update a preview environment (§18.1 `preview:` overlay) |
+| PR closed / merged | destroy the preview after its TTL |
+
+**Deploys are deduplicated by commit SHA.** Providers redeliver webhooks, and a double
+delivery must not produce two deployments of identical content. A redelivery for a SHA
+already released is a no-op that reports the existing release.
+
+**Status flows back.** Commit statuses and check runs move `pending → success | failure` with
+a deep link to the deployment, and preview environments comment their URL on the pull
+request. This is most of what makes the integration feel like part of the repository rather
+than a service that occasionally notices it.
+
+**`vesta.yaml` is read from the same commit** (§18.1), so configuration and code arrive
+together and a redeploy of an old SHA gets that SHA's configuration.
+
+**Monorepos** use path filters: a push touching only `services/billing/**` rebuilds billing
+and nothing else.
+
+**No webhook, no problem.** Private or air-gapped Git hosts can be polled at a configurable
+interval, and `vesta deploy` from a CLI or CI system is a first-class path that needs no Git
+integration at all.
+
 ---
 ## 13. Jobs and scheduled work
 
@@ -1951,6 +2121,43 @@ narrow-scope path is the documented one.
 Sessions are short-lived with refresh, revocable per device, and every authentication event —
 success, failure, MFA challenge, break-glass use — is audited.
 
+### 17.4 Quotas and limits
+
+Quotas exist so one team cannot consume an instance, and so a runaway autoscaler cannot
+consume a fleet. They are set by an instance administrator per team, and a team owner may
+subdivide them per project.
+
+| Quota | Counted as |
+|---|---|
+| apps, environments | objects |
+| replicas | desired count, not running count |
+| CPU, memory | **reserved**, not used — consistent with placement (§5) |
+| volume and backup storage | allocated bytes |
+| build minutes, concurrent builds | consumed per period |
+| egress, including cross-zone | bytes (§10.6) |
+
+**Enforcement is at the API, before the object exists.** Creating the eleventh environment
+against a quota of ten fails at save time, naming the quota and current usage — not at deploy
+time, and never as a container that mysteriously does not start. This is the same principle
+as port-conflict detection (§7.4): reject at the moment of authoring, when the person has
+context.
+
+**Soft and hard thresholds.** A soft quota notifies at 80% and again at 100% but permits the
+operation; a hard quota rejects. Storage and object counts default to soft, capacity and
+spend-shaped quotas to hard.
+
+**Autoscaling respects quotas explicitly.** An `AutoscalePolicy.Max` above the team's replica
+quota is capped, and the autoscaler emits `ScaleCapped` naming *the quota* as the constraint
+(§14.2). Silent capping during the traffic spike the autoscaler existed for is the failure
+this avoids.
+
+Separately from resource quotas, the API applies rate limits — per token, per IP for
+unauthenticated endpoints, and a distinct budget for webhook ingestion (§12.2), which is
+publicly reachable and therefore the most abusable surface.
+
+Quotas allocate; they do not bill. Cost figures (§20.11) are estimates and are not reconciled
+against an invoice.
+
 ---
 
 ## 18. Configuration, import, and interoperability
@@ -2148,6 +2355,51 @@ This exists for three reasons: it makes disaster recovery of the control plane a
 than a database restore, it makes moving between installs (or from a trial to production) a
 non-event, and it is an honest answer to "what happens if I want to leave". A platform whose
 users cannot leave has to earn their stay some other way.
+
+### 18.4 Templates
+
+A template is a pre-authored `vesta.yaml` (§18.1) plus the managed services and secret
+requirements an application needs — the one-click app catalog, expressed in the format that
+already exists rather than a parallel mechanism.
+
+```yaml
+template: ghost
+version: 2
+variables:
+  - name: DOMAIN
+    prompt: Public hostname
+    validate: hostname
+  - name: ADMIN_EMAIL
+    validate: email
+  - name: DB_PASSWORD
+    generate: { length: 32 }     # generated INTO the secrets system, never into the file
+services:
+  - type: mysql
+    version: "8"
+app:
+  image: ghost:5
+  # …ordinary vesta.yaml from here
+```
+
+**Instantiation produces an ordinary project.** Variables are filled, generated values are
+written to the secrets system (§11.6), and the result is a normal app with no residual
+coupling — the template is a starting point, not a controller. Nothing about the running
+project is owned by the template afterwards.
+
+**Templates are versioned, and updates are diffs.** An instantiated project records its
+template and version, so "version 3 is available" can be surfaced — and applying it is a
+reviewed diff through the same preview mechanism as Compose import (§18.2), never an
+automatic overwrite of configuration someone has since edited.
+
+**A template from a URL is untrusted input.** It can declare port bindings, links, and
+resource requests, so instantiation runs under the *instantiating user's* authority: a
+template cannot enable anything that user could not enable themselves, cannot bind a
+privileged port they lack rights to, and cannot link across projects without the usual
+consent (§7.5). The preview shows exactly what will be created before anything is.
+
+**The honest note on effort:** the mechanism here is small. A useful catalog is a hundred
+maintained templates, and that is a curation and maintenance commitment, not an engineering
+one. It should be budgeted as ongoing content work rather than as a feature that ships once.
 
 
 ## 19. Data model
@@ -2567,7 +2819,46 @@ is a WebSocket subscription to this bus, filtered by team — the same multiplex
 that carries log subscriptions, so a browser tab holds one socket, not one per panel.
 Nothing in the UI polls.
 
-### 20.13 Audit
+### 20.13 Notifications and outbound webhooks
+
+Both are projections of the internal event bus (axiom 5) — one subscription model, two
+transports. Nothing generates notifications by side effect; if it is not an event, it cannot
+be notified on.
+
+**Subscriptions** are `scope × event types × severity`, where scope walks the same chain as
+secrets and drains (org → project → environment → app). Separate routing matters: deployment
+chatter and page-worthy failures should not arrive in the same place, and a single global
+channel guarantees that either the noise is intolerable or the signal is missed.
+
+**Channels**: Slack, Discord, Google Chat, email (SMTP), and generic HTTP — reusing the
+notifier implementations already written for the Kubernetes edition.
+
+**Outbound webhooks** are signed with HMAC-SHA256 using a per-webhook secret, over a payload
+that includes its own timestamp so a captured delivery cannot be replayed later. Headers
+carry the event type and a delivery id.
+
+**Delivery is at-least-once**, with exponential backoff, bounded retries, and a visible
+dead-letter state. Consumers deduplicate on the delivery id; ordering is not guaranteed. Every
+attempt is recorded, so "did it fire?" is answerable without asking the receiving system.
+
+Three behaviors that keep this from becoming a nuisance:
+
+- **Continuously failing webhooks are auto-disabled** after a threshold of consecutive
+  failures, with a notification saying so. Retrying a dead endpoint forever is a background
+  load that grows silently and helps nobody.
+- **Events are coalesced.** A rolling deploy across twenty replicas emits a great many
+  events; the notifier batches and summarizes them into one message per deployment rather
+  than sixty. Anyone who has watched a deploy fill a Slack channel understands why this is not
+  optional.
+- **Payloads never contain secret values.** They carry references — secret name, version,
+  actor — and pass the same redaction filter as logs (§20.4). A webhook is an egress path to a
+  third party and is treated as one.
+
+A test-delivery action validates connectivity, auth, and signature handling against the real
+endpoint, because a notification channel is discovered to be broken at exactly the moment it
+is most needed.
+
+### 20.14 Audit
 
 Actor, action, target, IP, timestamp, outcome, and — for secret reveals — the stated reason.
 Immutable, exportable, and retained independently of the general event log, so trimming

@@ -538,7 +538,8 @@ fleet view within 60 seconds of one curl command.
 
 **M1 — Single container (week 3–4)**
 Deploy a public image to one server, one replica. Reconciler, `dockerx`, health checks,
-logs streaming, container exec. Proxy with certmagic terminating TLS on one route.
+logs streaming, container exec (§6.5 — a distinct permission, since a shell can print every
+secret the container holds). Proxy with certmagic terminating TLS on one route.
 Acceptance: `vesta deploy nginx --domain x.example.com` serves HTTPS.
 
 **M2 — Replicas and rollouts (week 5–6)** — *the differentiator*
@@ -568,7 +569,8 @@ exist is worse than doing it here.
 
 **M5 — Builds and git (week 11–13)**
 BuildKit integration with cache export, Dockerfile/Nixpacks/buildpack strategies, GitHub
-App + GitLab/Gitea webhooks, push-to-deploy, build logs streaming, deploy hooks, and the
+App + GitLab/Gitea webhooks, push-to-deploy, build logs streaming, deploy hooks (§12.2 —
+signature-verified ingestion, SHA deduplication, status reported back), and the
 registry pull-through cache / private registry (§12.1). Also **`vesta.yaml`** (§18.1) —
 read from the deployed commit, with field-level ownership and expiring UI overrides — which
 lands here because it only means anything once config can be read from a git commit.
@@ -583,7 +585,8 @@ environment, restore, verify, and record the measured RTO (ARCHITECTURE §16.3),
 (§16.1), managed-database **major-version upgrades** run as a job with extension pre-flight
 and a retained old data directory for rollback (§15.2), connection pooling, cron and one-shot
 jobs, resource
-limits, quotas, notifications, maintenance mode, and **log drains** to OTLP, Loki, syslog,
+limits, quotas (§17.4), notifications and signed outbound webhooks (§20.13), maintenance
+mode (§9.5), and **log drains** to OTLP, Loki, syslog,
 S3, or HTTP (ARCHITECTURE §20.6) — shipped from the agent so they keep working during a
 control-plane outage, with redaction applied before a line ever leaves the node, and a
 `Reliable` class that buffers through a sink outage without ever blocking the container.
@@ -603,7 +606,7 @@ Multi-server placement and constraints, spread/binpack, proxy mesh and internal 
 resolver, network zones for VPC vs public-only fleets (§10.6), fleet dashboard, proxy RED
 metrics (§20.9), service topology map (§20.10), cost allocation with idle-waste reporting
 (§20.11), Docker Compose import with secret detection (§18.2), `vesta export` (§18.3), OTLP,
-audit UI, `install.sh`, docs, migration importer
+audit UI, `install.sh` and node enrollment (§2.2), templates (§18.4), docs, migration importer
 that reads a Coolify install and produces Vesta projects/apps/environments.
 
 Also **signed releases and agent auto-update** (ARCHITECTURE §23). This moved forward from
