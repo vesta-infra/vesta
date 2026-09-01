@@ -108,8 +108,62 @@ and starts the agent — which posts the token, receives a client certificate fr
 CA, and dials the control stream (§6.1). The CA issues no certificate without a valid,
 unused, unexpired token.
 
+
+#### Provisioning Docker
+
+An app server without Docker gets it from the installer. Requiring people to prepare a host
+before they can add it is a step that fails often enough to lose them, and every comparable
+tool does this.
+
+**From Docker's official repository, not a nested script.** We add Docker's apt/yum
+repository with its GPG key and install from it. Piping a third-party installer from inside
+our own piped installer doubles the trust the operator is extending in a single command, and
+we can be specific about versions and verification if we do it ourselves. Debian/Ubuntu and
+the RHEL family are supported directly; anything else fails with a clear "install Docker
+24.0+ and re-run" rather than guessing.
+
+**An existing Docker is left alone.** If one is present and new enough it is used as-is. If
+it is too old the installer **refuses rather than upgrading** — upgrading someone's running
+Docker restarts their containers, and an installer for a new node must never take down
+workloads already on that host. The message names the version found and the version needed.
+
+**`daemon.json` is merged, never overwritten.** The file is read, our required settings are
+merged in, the original is backed up, and the diff is printed:
+
+```json
+{
+  "log-driver": "local",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true,
+  "default-address-pools": [ { "base": "10.0.0.0/8", "size": 24 } ]
+}
+```
+
+**`default-address-pools` is not optional for us.** Docker's out-of-the-box pools yield only
+a few dozen usable bridge networks, and Vesta creates one per app-environment (§7.1) plus one
+per service link (§7.5) — so a modest install exhausts the default allocation and new
+networks simply fail to create, with an error that does not obviously mean "you ran out of
+subnets". A `/8` carved into `/24`s gives 65,536 networks of 254 addresses, which retires the
+problem permanently. The base is configurable for hosts whose existing routing already uses
+`10.0.0.0/8`; the installer detects an overlap with existing routes and refuses rather than
+silently blackholing traffic.
+
+The log driver is the rotation policy from §7.3 — the default `json-file` with no cap is how
+self-hosted installs fill their disks. `live-restore` keeps containers running across a
+`dockerd` restart, which is what makes §23.5's "updating the agent never touches a workload"
+true for the runtime underneath it as well. On a host with containers already running, a
+`live-restore` change takes effect at the next daemon restart and the installer says so
+rather than restarting the daemon to apply it.
+
+**Opt-out and refusals.** `--no-docker-install` is available for managed or hardened hosts.
+Rootless Docker and Podman are detected and refused with the reason, because the agent needs
+the socket and capabilities neither provides in the same shape — a clear refusal at install
+is better than a node that enrolls and then cannot start anything.
+
+
 **Preflight runs before anything is written**, and fails with specifics rather than leaving a
-half-installed node: Docker present and a supported version; cgroup v2; sufficient disk;
+half-installed node: Docker present at a supported version **or installable** (above);
+cgroup v2; sufficient disk;
 ports 80/443 free or already ours; clock within tolerance of the control plane (§21). "Docker
 20.10 found, 24.0 or newer required" is a fixable message; a partially installed agent that
 never connects is not.
@@ -233,6 +287,68 @@ unmanageable.
 Because exposure is the proxy's job either way, **how `vestad` is packaged has no bearing on
 domains, TLS, or routing.** A systemd unit and a container both present the same loopback
 upstream. The choice is therefore made on other grounds (§22), and both are supported.
+
+### 2.5 The control-plane database
+
+Three supported configurations, all first-class:
+
+| | Provisioned by | Use when |
+|---|---|---|
+| **Postgres container** (default) | the installer, on the control node | the default — nothing to prepare, familiar operationally |
+| **External Postgres** | you | you already run Postgres, or want the control plane to hold no state |
+| **SQLite** | nothing — one file | single server, minimal footprint, or a control node that must not run Docker |
+
+#### `vestad` never talks to Docker
+
+The bundled Postgres is created by `install.sh` and supervised by **systemd**, not by
+`vestad`. This matters more than it looks: giving `vestad` the Docker socket to manage its own
+database would make it root-equivalent (§22) and destroy the reason it runs as an
+unprivileged user in the first place. It receives a connection string and nothing else, and
+cannot tell a bundled Postgres from an external one.
+
+The container carries the ordinary Vesta labels, so if the control node is also an app server
+its agent recognises it as managed infrastructure and leaves it alone (§6.3).
+
+#### Credentials, and the bootstrap ordering problem
+
+The database password cannot live in the secrets system, because the secrets system lives in
+the database. It is generated at install and written next to the KEK, `0600`, at the same
+trust tier — or supplied through a systemd credential where available. Anything with read
+access to that file already has the KEK, so this adds no new exposure; it is stated because
+"where does the DB password live" is otherwise the first question of every security review.
+
+#### Disaster recovery — and why auto-unseal matters here
+
+The control-plane database is backed up by the same subsystem as everything else (§16.2), to
+the same destinations, encrypted before it leaves the node.
+
+**With a file-based KEK, that backup is undecryptable without the KEK file** — and an
+operator who backs up the database while leaving the key on the burned host has a backup of
+ciphertext and nothing else. This is the disaster-recovery version of the trap, and it is why
+KMS auto-unseal being the default (§11.1) is load-bearing rather than merely convenient: with
+a KMS the backup is recoverable from KMS access alone, and the surviving artifact is
+sufficient. Installs on a file KEK are told, at install time and in the backup UI, that the
+key file is part of the backup.
+
+The bundled Postgres is a managed service in all but name, so its major-version upgrades run
+through the §15.2 path — pre-flight, verified backup, retained old data directory — rather
+than a separate mechanism.
+
+#### Paying the two-backend tax
+
+Supporting Postgres and SQLite means the less-used one silently rots unless that is actively
+prevented. It is prevented like this:
+
+- **One repository interface.** No handler, service, or scheduler knows which backend is
+  behind it. Backend-specific SQL exists only in `internal/store`.
+- **`sqlc` generates both dialects** from one schema. Migrations are written once, in
+  `goose`, with dialect differences confined to type aliases (§19).
+- **CI runs the full suite against both on every commit** — not nightly, not on a label.
+  A test that passes on one and fails on the other fails the build.
+- **`vesta db migrate --to postgres` is a supported, tested command**, exercised in CI on a
+  populated database. Choosing SQLite is never a trap: outgrowing it is a command, not a
+  rewrite, which is the property that makes offering the choice honest rather than a way of
+  postponing a decision onto the user.
 
 ---
 
@@ -813,6 +929,14 @@ than a naming convenience:
    written into config.
 3. **Placement affinity.** The scheduler prefers to co-locate linked workloads on the same
    node (§5). This is not cosmetic — see the cross-node problem below.
+
+**On network count.** A link network per `(consumer, target)` pair is strict but grows
+quadratically, and while addressing is not the constraint (§2.2 provisions 65,536 subnets),
+bridge and iptables overhead eventually is. Large installs can consolidate to one network per
+*target* — every consumer of `postgres` joining `vesta_link_postgres` — which is O(services)
+rather than O(pairs). The trade is explicit and is why it is not the default: consumers of a
+shared target become mutually reachable, which is a weaker guarantee than the per-pair form
+and should be chosen deliberately rather than inherited.
 
 Unlinking removes all three. There is no orphaned network membership and no stale
 `DATABASE_URL` pointing at something the app is no longer allowed to reach.
@@ -3156,9 +3280,13 @@ reasons that are security, not taste:
   it** — `docker exec` into it, read its memory. As a systemd service under an unprivileged
   `vesta` user with `ProtectSystem`, `PrivateTmp`, `NoNewPrivileges` and a syscall filter,
   that path does not exist.
-- The control node does not otherwise need Docker at all. Only app servers run containers,
-  so containerizing the control plane adds a dependency, an attack surface, and a layer of
-  indirection to a machine that needed none of them.
+- With the default bundled Postgres (§2.5) the control node does run Docker, and **`docker`
+  group membership there is root-equivalent and therefore control-plane-equivalent** (T4) —
+  it should be restricted to the operators who already hold that authority. Choosing external
+  Postgres or SQLite removes Docker from the control node entirely, which is the hardened
+  configuration and the one to pick when the control plane is dedicated.
+- Either way, `vestad` itself is not given the Docker socket: the bundled database is
+  supervised by systemd, not by the control plane, precisely so `vestad` stays unprivileged.
 
 The container image remains supported — for evaluation, and for hosts where it is the only
 option — under two rules stated in the documentation rather than left to be discovered:

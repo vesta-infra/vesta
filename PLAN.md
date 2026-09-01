@@ -165,7 +165,7 @@ advantages are real.
 | Layer | Choice | Note |
 |---|---|---|
 | Control plane API | Go 1.25, Gin | reused from `vesta-kubernetes/api` |
-| Store | SQLite (modernc, pure Go) default; Postgres for HA | one repository interface, both behind it |
+| Store | Postgres (bundled container by default, or external); SQLite fully supported | one repository interface, both in CI on every commit |
 | Migrations / queries | goose + sqlc | typed queries, no ORM |
 | CP ↔ agent | gRPC bidi stream over mTLS, **agent dials out** | no inbound port on app servers |
 | Container runtime | Docker Engine API via Moby SDK | never the CLI |
@@ -543,8 +543,9 @@ Each milestone ends with something demonstrable, not a layer.
 
 **M0 — Skeleton (week 1–2)**
 Serve the `go-import` meta tag at `getvesta.sh` first — everything else imports through it.
-Then: Go module `getvesta.sh`, five `cmd/` binaries, gRPC contracts, agent enrollment with mTLS, store with
-migrations, `vesta server add` works end to end. Acceptance: a fresh VPS shows up in the
+Then: Go module `getvesta.sh`, five `cmd/` binaries, gRPC contracts, agent enrollment with
+mTLS, store with migrations against both backends, an installer that provisions Docker and
+the bundled Postgres (§2.2, §2.5), and `vesta server add` working end to end. Acceptance: a fresh VPS shows up in the
 fleet view within 60 seconds of one curl command.
 
 **M1 — Single container (week 3–4)**
@@ -647,9 +648,11 @@ canary node and watch it revert itself and halt the rollout, with zero container
   resolves the original entrypoint from the image manifest not from guessing, and there is
   a per-app escape hatch that falls back to plain env injection with a visible warning in
   the UI.
-- **SQLite as the default store.** Fine for one control plane; wrong the moment someone
-  wants two. Mitigation: repository interface from day one, Postgres tested in CI on every
-  commit, and the docs say "Postgres for HA" without hedging.
+- **Two store backends.** Postgres is the default (bundled container or external) and SQLite
+  is fully supported, which means the less-used one rots unless that is actively prevented.
+  Mitigation, specified in ARCHITECTURE §2.5: one repository interface, `sqlc` generating both
+  dialects from one schema, the full suite run against both on **every commit** rather than
+  nightly, and a tested `vesta db migrate --to postgres` so choosing SQLite is never a trap.
 - **Scope.** This document describes Coolify plus a real orchestrator plus a real secrets
   system. M2 and M3 are the product; everything else is table stakes that can slip. If a
   quarter has to be cut, cut M6 and M7, not M2 or M3.
