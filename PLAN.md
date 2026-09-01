@@ -677,9 +677,14 @@ canary node and watch it revert itself and halt the rollout, with zero container
    entries, so the checklist becomes a rotation checklist: credentials that lived in
    plaintext are treated as exposed and reissued rather than carried forward. Accepted cost:
    migration is slower than a tool that copies secrets automatically.
-4. **Single-binary control plane vs. containerized.** Shipping `vestad` as a systemd unit
-   is faster and lighter; shipping it as a container is what everyone expects. Probably
-   both, with systemd as the documented default.
+4. ~~**Single-binary control plane vs. containerized.**~~ **Resolved.** Both ship; **systemd
+   is the default**. The question turned out to be narrower than it looked: `vestad` sits
+   behind `vesta-proxy` either way (ARCHITECTURE §2.4), so packaging has no bearing on
+   domains, TLS, or routing. It is decided on security instead — a containerized control
+   plane makes `docker` group membership equivalent to holding the KEK, and the control node
+   otherwise needs no Docker at all. The image stays supported with two documented rules: the
+   KEK arrives by file mount or KMS and never an environment variable, and not on a host with
+   untrusted `docker` group members (§22).
 5. ~~**Two editions, one name.**~~ **Resolved.** Module path is `getvesta.sh` (§8); the
    editions version and release **independently** (ARCHITECTURE §23.1); and the CLI is **one
    binary** addressing both through contexts (§2.3) — which avoids a collision rather than
