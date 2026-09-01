@@ -17,3 +17,9 @@ apt install protobuf-compiler    # Debian/Ubuntu
 change additively — forever. They are the path by which a stranded agent is recovered, so
 an incompatible change to them means SSH-ing to every box, which is the failure the agent
 exists to prevent. See ARCHITECTURE §23.2.
+
+## Generated code is not committed
+
+`make proto` regenerates into `internal/stream/{frozenpb,nodepb}`. Generated files are
+excluded from version control so a stale checkout cannot silently disagree with the
+contract; CI regenerates and fails if the result differs from what the build expects.

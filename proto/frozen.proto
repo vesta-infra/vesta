@@ -1,0 +1,64 @@
+// FROZEN CONTRACT — ADDITIVE CHANGES ONLY, FOREVER.
+//
+// These messages are the path by which a stranded agent is recovered: an agent too old to
+// understand the current Spec must still be able to say hello, be recognised, and be
+// handed a new binary. Breaking them means SSH-ing to every box in a fleet, which is the
+// exact failure the agent exists to prevent.
+//
+// Rules for this file:
+//   - Never remove a field. Never renumber one. Never change a field's type.
+//   - Never rename a message or the service.
+//   - New fields are appended with new numbers, and every peer must tolerate their absence.
+//
+// Everything else in proto/ may evolve freely, negotiated on ProtocolVersion.
+// See ARCHITECTURE.md §23.2.
+
+syntax = "proto3";
+
+package vesta.frozen.v1;
+
+option go_package = "getvesta.sh/internal/stream/frozenpb";
+
+// Hello is the first message on every control stream. It is deliberately minimal: it must
+// remain parseable by a control plane many versions newer than the agent that sent it.
+message Hello {
+  string node_id = 1;
+  string version = 2;          // human-readable release, e.g. "0.7.3"
+  uint32 protocol = 3;         // what this peer can actually speak
+  bytes  agent_pubkey = 4;     // X25519, regenerated every start (§11.2)
+  string applied_revision = 5; // the Spec revision currently converged on, if any
+  string arch = 6;             // e.g. "linux/arm64", for choosing an update artifact
+}
+
+// HelloAck tells an agent whether it is in contract, and what to do if not. An
+// out-of-contract agent is never disconnected — it is told, and then offered an update.
+message HelloAck {
+  bool   accepted = 1;
+  uint32 server_protocol = 2;
+  uint32 min_supported_protocol = 3;
+  string message = 4;    // human-readable reason when accepted is false
+  bool   update_offered = 5;
+}
+
+// UpdateOffer precedes a binary transfer. `required` marks an update the agent should take
+// even under a policy that would otherwise defer it — a protocol break, not a preference.
+message UpdateOffer {
+  string version = 1;
+  string sha256 = 2;
+  bytes  signature = 3;  // Ed25519 over the artifact, verified with a compiled-in key
+  uint64 size = 4;
+  bool   required = 5;
+  string arch = 6;
+}
+
+message UpdateChunk {
+  bytes  data = 1;
+  uint64 offset = 2;
+}
+
+message UpdateResult {
+  bool   ok = 1;
+  string version = 2;
+  string error = 3;
+  bool   reverted = 4;   // the trial deadline passed and the previous binary was restored
+}

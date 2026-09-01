@@ -54,7 +54,7 @@ release:
 # a container; the .proto files in proto/ are the contract either way.
 proto:
 	@command -v protoc >/dev/null || { echo "protoc not found: run 'make tools' or see proto/README.md"; exit 1; }
-	protoc --go_out=. --go_opt=module=getvesta.sh \
+	protoc -I proto --go_out=. --go_opt=module=getvesta.sh \
 	       --go-grpc_out=. --go-grpc_opt=module=getvesta.sh \
 	       proto/*.proto
 

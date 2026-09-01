@@ -1,0 +1,235 @@
+// The evolving contract between control plane and agents.
+//
+// Everything here is negotiated on ProtocolVersion and may change with a version bump.
+// The frozen recovery path lives in frozen.proto and may not.
+//
+// The agent always dials. The control plane cannot open a connection to a node, which is
+// what lets app servers sit behind NAT with no inbound port and no SSH exposure — so when
+// the control plane needs a stream (exec, logs, a build), it asks the agent to dial back.
+// See ARCHITECTURE.md §6.1.
+
+syntax = "proto3";
+
+package vesta.node.v1;
+
+import "frozen.proto";
+
+option go_package = "getvesta.sh/internal/stream/nodepb";
+
+service Node {
+  // Control is opened once and held for the life of the agent. Reconnection is by
+  // backoff with a fresh Hello; there is no replay log, because a Spec is a full state
+  // transfer and reconnection is therefore stateless.
+  rpc Control(stream NodeMessage) returns (stream ServerMessage);
+
+  // Opened on demand by the agent, after the control stream tells it to. Log volume must
+  // never apply backpressure to Spec delivery, so these are separate streams on the same
+  // connection rather than messages on the control stream.
+  rpc Logs(stream LogChunk) returns (Ack);
+  rpc Exec(stream ExecFrame) returns (stream ExecFrame);
+  rpc Build(stream BuildChunk) returns (Ack);
+
+  // CertStore backs certmagic with cluster-wide storage, so that several nodes serving
+  // one hostname share issuance, locking, and renewal instead of racing ACME (§9.4).
+  rpc CertStore(stream CertOp) returns (stream CertReply);
+}
+
+message ServerMessage {
+  oneof msg {
+    vesta.frozen.v1.HelloAck    hello_ack = 1;
+    ApplySpec                   apply = 2;
+    OpenStream                  open = 3;
+    Command                     command = 4;
+    Pong                        pong = 5;
+    vesta.frozen.v1.UpdateOffer update_offer = 6;
+    vesta.frozen.v1.UpdateChunk update_chunk = 7;
+  }
+}
+
+message NodeMessage {
+  oneof msg {
+    vesta.frozen.v1.Hello        hello = 1;
+    Status                       status = 2;
+    Event                        event = 3;
+    Ping                         ping = 4;
+    vesta.frozen.v1.UpdateResult update_result = 5;
+  }
+}
+
+// ApplySpec carries the whole desired state of one host as canonical JSON, not as a
+// generated message. The Spec's revision is a hash over that encoding (core.Spec), so
+// re-encoding it through protobuf would put a second serialization between the hash and
+// the bytes and give us two ways to disagree about what a revision means.
+message ApplySpec {
+  string revision = 1;
+  bytes  spec_json = 2;
+  int64  issued_unix_nano = 3;
+}
+
+message OpenStream {
+  StreamKind kind = 1;
+  string     token = 2;      // single-use, short-lived, bound to one target
+  string     target = 3;     // container id, app-env, or build id
+  map<string, string> params = 4;
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  STREAM_KIND_LOGS = 1;
+  STREAM_KIND_EXEC = 2;
+  STREAM_KIND_BUILD = 3;
+}
+
+message Command {
+  CommandKind kind = 1;
+  string      target = 2;
+  map<string, string> params = 3;
+}
+
+enum CommandKind {
+  COMMAND_KIND_UNSPECIFIED = 0;
+  COMMAND_KIND_RESTART = 1;
+  COMMAND_KIND_PULL = 2;
+  COMMAND_KIND_PRUNE = 3;
+  COMMAND_KIND_DRAIN_NODE = 4;
+  COMMAND_KIND_REISSUE_CERT = 5;
+  COMMAND_KIND_RESYNC = 6;
+}
+
+// Status is the agent's periodic report. `applied_revision` against the revision the
+// control plane last sent is how a stalled convergence is detected.
+message Status {
+  string applied_revision = 1;
+  repeated AppStatus apps = 2;
+  NodeResources resources = 3;
+  int64  clock_offset_ms = 4;   // reported, not corrected; large skew is an event (§21)
+  repeated string listening_ports = 5; // ports held by non-Vesta processes (§7.4)
+}
+
+message AppStatus {
+  string app_spec_id = 1;
+  repeated ReplicaStatus replicas = 2;
+}
+
+message ReplicaStatus {
+  int32  index = 1;
+  string container_id = 2;
+  string spec_hash = 3;
+  int32  secrets_ver = 4;
+  ReplicaState state = 5;
+  bool   ready = 6;
+  string ip = 7;
+  int32  restarts = 8;
+  string message = 9;
+}
+
+enum ReplicaState {
+  REPLICA_STATE_UNSPECIFIED = 0;
+  REPLICA_STATE_CREATING = 1;
+  REPLICA_STATE_STARTING = 2;
+  REPLICA_STATE_RUNNING = 3;
+  REPLICA_STATE_DRAINING = 4;
+  REPLICA_STATE_STOPPED = 5;
+  REPLICA_STATE_PARKED = 6;   // scaled to zero, stopped not deleted (§14.3)
+  REPLICA_STATE_FAILED = 7;
+}
+
+message NodeResources {
+  double cpu_cores = 1;
+  int64  memory_bytes = 2;
+  int64  memory_available_bytes = 3;
+  int64  disk_bytes = 4;
+  int64  disk_available_bytes = 5;
+}
+
+message Event {
+  int64  unix_nano = 1;
+  string kind = 2;
+  string subject = 3;
+  string message = 4;
+  map<string, string> fields = 5;
+}
+
+message Ping { int64 unix_nano = 1; }
+message Pong { int64 unix_nano = 1; }
+message Ack  { bool ok = 1; string error = 2; }
+
+message LogChunk {
+  string token = 1;
+  repeated LogLine lines = 2;
+  uint64 dropped = 3;   // never silently: a gap the reader must be shown (§20.4)
+}
+
+message LogLine {
+  int64  unix_nano = 1;
+  uint64 seq = 2;       // per-container monotonic; exact ordering within one container
+  string app = 3;
+  string env = 4;
+  int32  replica = 5;
+  string release = 6;
+  string run_id = 7;
+  string source = 8;    // stdout | stderr | build | job | deploy | agent
+  string text = 9;
+}
+
+message ExecFrame {
+  string token = 1;
+  oneof frame {
+    ExecStart start = 2;
+    bytes     stdin = 3;
+    bytes     stdout = 4;
+    bytes     stderr = 5;
+    ExecResize resize = 6;
+    ExecExit  exit = 7;
+  }
+}
+
+message ExecStart {
+  string container_id = 1;
+  repeated string command = 2;
+  bool   tty = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}
+
+message ExecResize { uint32 width = 1; uint32 height = 2; }
+message ExecExit { int32 code = 1; string error = 2; }
+
+message BuildChunk {
+  string token = 1;
+  oneof chunk {
+    bytes log = 2;
+    BuildResult result = 3;
+  }
+}
+
+message BuildResult {
+  bool   ok = 1;
+  string digest = 2;   // always a digest; releases never reference tags (§12)
+  string error = 3;
+}
+
+message CertOp {
+  CertOpKind kind = 1;
+  string key = 2;
+  bytes  value = 3;
+  string lock_id = 4;
+}
+
+enum CertOpKind {
+  CERT_OP_KIND_UNSPECIFIED = 0;
+  CERT_OP_KIND_LOAD = 1;
+  CERT_OP_KIND_STORE = 2;
+  CERT_OP_KIND_DELETE = 3;
+  CERT_OP_KIND_EXISTS = 4;
+  CERT_OP_KIND_LIST = 5;
+  CERT_OP_KIND_LOCK = 6;
+  CERT_OP_KIND_UNLOCK = 7;
+}
+
+message CertReply {
+  bool   ok = 1;
+  bytes  value = 2;
+  repeated string keys = 3;
+  string error = 4;
+}
