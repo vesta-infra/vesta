@@ -137,7 +137,12 @@ you rotate." See §6.1 (T4) for how this sits in the full threat model.
 
 ---
 
-## 3. Language: Go, decided
+## 3. Foundations, decided
+
+Two choices everything else rests on, each with an obvious alternative that deserves an
+answer rather than a shrug.
+
+### 3.1 Language: Go
 
 The prototype in `vesta-old/` is a Rust agent behind a NestJS API. That combination is
 being retired. Everything becomes Go.
@@ -175,6 +180,94 @@ advantages are real.
 | UI | React + TS + Tailwind, embedded via `embed.FS` | reused from `vesta-kubernetes/ui` |
 | CLI | Cobra | reused from `vesta-kubernetes/cli` |
 | Telemetry | OTLP export, optional | off by default |
+
+
+### 3.2 Substrate: our own reconciler, decided
+
+Two existing systems already do much of what M2 and M6.5 describe, and any competent
+reviewer will ask why we are not building on one. The honest answer needs to concede what
+they would give us before explaining what they would cost.
+
+**What we would get for free:**
+
+| | Docker Swarm | HashiCorp Nomad |
+|---|---|---|
+| Replicas per host | yes | yes (allocations) |
+| Rolling updates with health gates | yes | yes, plus canary and auto-revert |
+| Any-node ingress | routing mesh | with a proxy |
+| Secrets not in `docker inspect` | yes — tmpfs at `/run/secrets` | via Vault or templates |
+| Scheduler with spread/binpack | basic | constraints, affinities, spread |
+| Cron / batch | no | periodic and batch jobs |
+| Autoscaling | no | Nomad Autoscaler |
+| Already installed | **yes, in every Docker** | no |
+
+Between them that is most of §5, §8, §13 and §14 — six to ten weeks, against a scheduler
+whose bugs were fixed years ago.
+
+#### Why not Swarm
+
+Swarm is more alive than its reputation suggests: Mirantis has committed support through
+2030 and added CSI. It is not a dying-project argument.
+
+- **Its secrets are immutable.** You cannot update a Swarm secret in place — you create a new
+  one and update the service. Our rotation model (§6, versioned secrets, rotation as an
+  ordinary rolling restart, releases pinning the versions they deployed with) does not map
+  onto that without fighting it. And Swarm delivers files, not environment variables, so we
+  would still ship `vesta-init` to convert them.
+- **The manager becomes authoritative, not the agent.** That directly contradicts the axiom
+  that a node keeps converging when the control plane is gone.
+- **It costs us `live-restore`.** Docker's `live-restore` — containers surviving a `dockerd`
+  restart — does not apply to Swarm services. That single flag is what makes "updating the
+  agent never touches a workload" true all the way down (ARCHITECTURE §2.2, §23.5). Adopting
+  Swarm would trade a property we consider foundational for scheduling we can write.
+
+#### Why not Nomad
+
+Nomad is the closest existing thing to this architecture — server/client agents, declarative
+jobs, reconciliation, allocations, task drivers. Architecturally it is a compliment to the
+design rather than a rebuke.
+
+- **BUSL, with no escape hatch.** Nomad CE is not OSI open source, and unlike Terraform —
+  which produced OpenTofu — no viable community fork emerged, because Nomad lacked the
+  commercial ecosystem pressure that forced one. A BUSL dependency is therefore permanent: a
+  licensing asterisk on an open-source project, a redistributed BUSL binary inside a
+  "single static binary" story, and a foreclosed path to any hosted Vesta, since a competing
+  offering is exactly where BUSL bites.
+- **Its footprint and topology contradict ours.** Nomad servers hold all state in memory, and
+  HashiCorp's production guidance is 4–8 cores and 16–32 GB with **sub-10 ms latency between
+  servers** for Raft. Our answer to "Coolify is heavy" is a 60 MB control plane on a $12 VPS,
+  and §10.6 is explicitly built for fleets spread across providers on public IPs — where that
+  latency requirement cannot be met. We would end up with a single Nomad server and no HA,
+  reintroducing the constraint we designed around.
+- **Secrets fit against the grain.** Nomad's answer is Vault — another BUSL product, more
+  weight — or template rendering into the allocation directory. We would build our sealing
+  and handoff path (§6) anyway, beside Nomad's, which is the worst of both.
+
+#### What we take instead
+
+Not depending on them is not a reason to ignore them. Both are read closely, and the debt is
+acknowledged in the sections that owe it:
+
+- **From Swarm:** secrets delivered as a tmpfs mount rather than environment variables — our
+  §11.3 handoff is that idea with an `exec` shim to reach `process.env`; and the routing mesh,
+  where any node accepts traffic for any service, which is ARCHITECTURE §10.1.
+- **From Nomad:** deployment semantics — canary, progress deadline, automatic revert — which
+  shape §8; the spread/binpack scheduler with constraints and affinities behind §5; drain
+  semantics; the task-driver abstraction that §25 mirrors as a runtime extension point; and
+  job-spec ergonomics, which inform `vesta.yaml` (§18.1).
+
+#### What would change this decision
+
+Recorded so this stays falsifiable rather than becoming folklore:
+
+- Our reconciler still producing correctness bugs after M2 hardening — meaning we bought
+  control we cannot exercise correctly.
+- Nomad relicensing to an OSI licence, or a fork reaching real adoption.
+- A requirement for non-container workloads — VMs, bare-metal batch — where writing our own
+  scheduler stops being proportionate.
+
+None of these are true today. All three are checkable.
+
 
 ---
 

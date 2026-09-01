@@ -1042,6 +1042,9 @@ for multi-node environments (one node at a time by default, `maxParallelNodes` t
         └── replicas ──┴──▶ all done ──────────────────────▶┘ Succeeded
 ```
 
+The vocabulary and semantics here — progress deadline, canary, automatic revert — are
+Nomad's deployment model, which is worth reading before implementing this (PLAN §3.2).
+
 **The ordering is the whole point.** New replica is *ready and in the pool* before the old
 one leaves it. At `replicas: 1` this means momentarily two containers and zero dropped
 requests — the single-server zero-downtime deploy.
@@ -1207,6 +1210,9 @@ that has one.
                  ▼  mesh hop: HTTP/2 over mTLS (node certs, internal CA), :8443
               node3 :8443 ──▶ 172.20.0.11:3000   container, local to node3
 ```
+
+This is Docker Swarm's routing mesh, rebuilt at L7 with locality preference and mTLS between
+peers (PLAN §3.2 records why we take the idea without taking the dependency).
 
 Why this is worth the hop: **DNS no longer has to be correct about placement.** Point DNS
 at all your nodes, or one, or two edge boxes — routing stays correct in every case. Scaling
@@ -1570,6 +1576,10 @@ after a restart.
 
 The agent opens the bundle in memory (`mlock`ed where the OS permits, zeroed after use)
 and delivers by one of two mechanisms.
+
+The tmpfs approach is Swarm's, which mounts secrets at `/run/secrets` rather than putting
+them in the container's environment. What we add is the `exec` shim, so an application reads
+them from `process.env` unchanged instead of being rewritten to read files (PLAN §3.2).
 
 **Default — tmpfs handoff:**
 
