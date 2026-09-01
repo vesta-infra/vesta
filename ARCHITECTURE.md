@@ -2344,7 +2344,74 @@ The secret-detection step is the highest-value part and worth calling out: the s
 common condition of an incoming Compose file is a database password sitting in
 `environment:`, and the moment of import is the one moment a user is receptive to moving it.
 
-### 18.3 Export, because lock-in is a trust problem
+### 18.3 Coolify import
+
+Point the importer at an existing Coolify install and it produces the equivalent Vesta
+objects, through the same preview-and-diff pipeline as Compose import (§18.2).
+
+| Comes across | Does not |
+|---|---|
+| projects, applications, environments | **secret values** — see below |
+| domains and routes | Coolify's internal state and job history |
+| resource limits, replica counts, restart policy | anything requiring Coolify's `APP_KEY` |
+| volumes (as Local tier, §16.1) | |
+| scheduled tasks → jobs (§13) | |
+| environment variables Coolify held in plaintext, **subject to the same secret-detection heuristic as Compose import** — a plaintext value named `*_TOKEN` is offered as a secret, not copied forward as config | |
+
+#### Secret values are not imported, and that is the design
+
+Moving a secret requires seeing its plaintext, and Coolify's are encrypted under its
+`APP_KEY`. Importing them therefore means Vesta asking for the key that decrypts a user's
+entire Coolify installation.
+
+**We do not build that code path.** Not a sealed-bundle exporter, not a decrypt-on-import
+mode, not an optional flag. The importer needs read access to structure and nothing more, so
+there is no configuration in which Vesta holds another platform's master key — and no
+incident in which it can leak one. A migration tool is exactly the kind of software that is
+run once, under time pressure, by someone who will grant it whatever it asks for; the right
+design is to not ask.
+
+What is imported instead is the **shape** of each app's secrets: every required name, at the
+right scope, as an empty entry. Deployment then fails fast naming what is missing (§18.1
+`secrets.requires`), rather than starting an app that crash-loops on a nil credential.
+
+#### Re-entry is the rotation
+
+The obvious objection is that someone must now enter those values by hand. The answer is that
+they should not enter the *old* ones:
+
+> Those credentials sat where anyone with server access could read them — in container
+> config, in a compose file on disk, in a deploy log (PLAN §1.2). They should be treated as
+> exposed. The migration is not the moment to carry them forward intact; it is the moment to
+> issue new ones.
+
+So the import checklist is a rotation checklist. For each required secret it offers the
+source system's rotation URL where one is known, and records `origin: migrated` with the date
+the value was first set. The end state is a fleet whose credentials are all newer than the
+install they came from — which is a better outcome than a faithful copy, and unreachable by
+any importer that succeeds silently.
+
+#### Making it bearable
+
+Hand-entering two hundred values through browser fields would be its own security problem, so
+the ergonomics are part of the design:
+
+- **Grouping.** Names recurring across apps are proposed as one project-scoped shared secret
+  (§11.6), entered once rather than per app.
+- **Offline template.** `vesta secret template --project acme > secrets.env` emits every
+  required name with an empty value. The operator fills it on their own machine, applies it
+  with `vesta secret set --from secrets.env`, and deletes it. One file, one place, one moment
+  — instead of values scattered through a browser, a clipboard manager, and a chat window.
+- **Progress is visible.** "14 of 22 required secrets set, 3 apps blocked" is shown until the
+  migration is complete, so a half-migrated install is an obvious state rather than a
+  surprise at the first deploy.
+
+**The accepted trade, stated plainly:** this makes migration slower than a tool that carries
+secrets across automatically, and some users will find that annoying. It is the deliberate
+choice. The alternative buys convenience by building a mechanism whose whole purpose is to
+handle someone else's master key, and that mechanism is a liability for as long as it exists.
+
+### 18.4 Export, because lock-in is a trust problem
 
 `vesta export` emits, in the same schema as `vesta.yaml` (§18.1), the full declarative
 definition of a project — apps, environments,
@@ -2356,7 +2423,7 @@ than a database restore, it makes moving between installs (or from a trial to pr
 non-event, and it is an honest answer to "what happens if I want to leave". A platform whose
 users cannot leave has to earn their stay some other way.
 
-### 18.4 Templates
+### 18.5 Templates
 
 A template is a pre-authored `vesta.yaml` (§18.1) plus the managed services and secret
 requirements an application needs — the one-click app catalog, expressed in the format that

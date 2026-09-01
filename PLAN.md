@@ -605,8 +605,8 @@ ships disabled for production environments.
 Multi-server placement and constraints, spread/binpack, proxy mesh and internal DNS
 resolver, network zones for VPC vs public-only fleets (§10.6), fleet dashboard, proxy RED
 metrics (§20.9), service topology map (§20.10), cost allocation with idle-waste reporting
-(§20.11), Docker Compose import with secret detection (§18.2), `vesta export` (§18.3), OTLP,
-audit UI, `install.sh` and node enrollment (§2.2), templates (§18.4), docs, migration importer
+(§20.11), Docker Compose import with secret detection (§18.2), `vesta export` (§18.4), OTLP,
+audit UI, `install.sh` and node enrollment (§2.2), templates (§18.5), docs, migration importer
 that reads a Coolify install and produces Vesta projects/apps/environments.
 
 Also **signed releases and agent auto-update** (ARCHITECTURE §23). This moved forward from
@@ -656,10 +656,14 @@ canary node and watch it revert itself and halt the rollout, with zero container
 2. **Sealed mode ergonomics.** Requiring an unseal after every control-plane restart will
    annoy solo operators into disabling it. Is auto-unseal via a cloud KMS the real default,
    with Shamir as the paranoid option?
-3. **Coolify importer fidelity.** Read-only import of apps and domains is achievable, and
-   shares the preview-and-diff pipeline with Compose import (ARCHITECTURE §18.2). Still
-   open: importing their secrets means asking users to paste plaintext once — acceptable as
-   a one-time migration with an immediate forced-rotation prompt, or not at all?
+3. ~~**Coolify importer fidelity.**~~ **Resolved** (ARCHITECTURE §18.3). Structure, domains,
+   volumes, schedules and plaintext config import; **secret values do not**. Vesta will not
+   ask for Coolify's `APP_KEY`, and no code path exists that would accept it — a decrypting
+   importer is a liability for as long as it exists, and it is run precisely by people under
+   time pressure who will grant it whatever it asks. Required secret *names* import as empty
+   entries, so the checklist becomes a rotation checklist: credentials that lived in
+   plaintext are treated as exposed and reissued rather than carried forward. Accepted cost:
+   migration is slower than a tool that copies secrets automatically.
 4. **Single-binary control plane vs. containerized.** Shipping `vestad` as a systemd unit
    is faster and lighter; shipping it as a container is what everyone expects. Probably
    both, with systemd as the documented default.
