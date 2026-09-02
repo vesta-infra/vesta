@@ -14,7 +14,7 @@ LDFLAGS := -s -w \
 	-X getvesta.sh/internal/version.Commit=$(COMMIT) \
 	-X getvesta.sh/internal/version.Date=$(DATE)
 
-.PHONY: all build test vet fmt check clean release proto tools
+.PHONY: all build test test-postgres vet fmt check clean release proto tools
 
 all: check build
 
@@ -28,6 +28,12 @@ bin/%:
 # nightly, so the less-used one cannot rot (ARCHITECTURE §2.5).
 test:
 	go test -race ./...
+
+# Both backends, locally. CI sets VESTA_TEST_POSTGRES from a service container instead.
+# The suite logs a warning when it is unset, so a green run without it is not mistaken
+# for full coverage.
+test-postgres:
+	@VESTA_TEST_POSTGRES=$$(deploy/postgres-test.sh start) go test -race ./... ; 	 status=$$? ; deploy/postgres-test.sh stop ; exit $$status
 
 vet:
 	go vet ./...
