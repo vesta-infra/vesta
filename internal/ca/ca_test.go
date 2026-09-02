@@ -300,3 +300,29 @@ func TestFindAndVerifyLooksUpByHash(t *testing.T) {
 		t.Fatalf("an unknown secret should not match any record, got %v", err)
 	}
 }
+
+// First run reaches the control plane at the host's IP before any domain exists (§2.4).
+// An address placed in DNSNames does not satisfy verification, so it must become an IP
+// SAN — this is the certificate that makes bootstrap possible at all.
+func TestIssuedCertificateVerifiesForAnIPAddress(t *testing.T) {
+	c, now := newCA(t)
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	certPEM, err := c.IssueNode("control-plane", pub, time.Hour, now,
+		[]string{"vesta.example.com", "127.0.0.1"}, x509.ExtKeyUsageServerAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(certPEM)
+	cert, _ := x509.ParseCertificate(block.Bytes)
+
+	for _, host := range []string{"vesta.example.com", "127.0.0.1"} {
+		if _, err := cert.Verify(x509.VerifyOptions{
+			Roots:       c.Pool(),
+			CurrentTime: now.Add(time.Minute),
+			DNSName:     host,
+			KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err != nil {
+			t.Fatalf("certificate does not verify for %s: %v", host, err)
+		}
+	}
+}

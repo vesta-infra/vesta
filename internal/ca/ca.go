@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -154,41 +155,77 @@ func (c *CA) Pool() *x509.CertPool {
 	return p
 }
 
-// IssueNode signs a client certificate binding nodeID to pub.
+// LeafOptions describes a certificate to issue.
 //
-// The public key comes from the node, which generated the pair locally; the private half
-// is never transmitted and never held here. `usage` decides whether the certificate may
-// act as a client (an agent) or a server (the control plane's own endpoint).
-func (c *CA) IssueNode(nodeID string, pub crypto.PublicKey, ttl time.Duration, now time.Time, dnsNames []string, usage x509.ExtKeyUsage) ([]byte, error) {
-	if nodeID == "" {
+// IPAddresses is not decoration: first-run reaches the control plane at the host's IP
+// before any domain exists (§2.4), and an IP in DNSNames does not satisfy verification —
+// it must be an IP SAN. Omitting it makes bootstrap impossible in exactly the case
+// bootstrap exists for.
+type LeafOptions struct {
+	NodeID      string
+	TTL         time.Duration
+	DNSNames    []string
+	IPAddresses []net.IP
+	Usage       x509.ExtKeyUsage
+}
+
+// IssueLeaf signs a certificate for pub.
+//
+// The public key comes from the holder, which generated the pair locally; the private
+// half is never transmitted and never held here.
+func (c *CA) IssueLeaf(pub crypto.PublicKey, opt LeafOptions, now time.Time) ([]byte, error) {
+	if opt.NodeID == "" {
 		return nil, errors.New("ca: refusing to issue a certificate with an empty node id")
 	}
-	if ttl <= 0 {
-		ttl = NodeCertTTL
+	if opt.TTL <= 0 {
+		opt.TTL = NodeCertTTL
+	}
+	if opt.Usage == 0 {
+		opt.Usage = x509.ExtKeyUsageClientAuth
 	}
 	serial, err := randomSerial()
 	if err != nil {
 		return nil, err
 	}
-	uri, err := nodeURI(nodeID)
+	uri, err := nodeURI(opt.NodeID)
 	if err != nil {
 		return nil, err
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: nodeID, Organization: []string{"Vesta"}},
+		Subject:      pkix.Name{CommonName: opt.NodeID, Organization: []string{"Vesta"}},
 		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(ttl),
+		NotAfter:     now.Add(opt.TTL),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{usage},
+		ExtKeyUsage:  []x509.ExtKeyUsage{opt.Usage},
 		URIs:         []*url.URL{uri},
-		DNSNames:     dnsNames,
+		DNSNames:     opt.DNSNames,
+		IPAddresses:  opt.IPAddresses,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, pub, c.key)
 	if err != nil {
-		return nil, fmt.Errorf("ca: sign for %s: %w", nodeID, err)
+		return nil, fmt.Errorf("ca: sign for %s: %w", opt.NodeID, err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+}
+
+// IssueNode signs a client certificate binding nodeID to pub — the common case.
+func (c *CA) IssueNode(nodeID string, pub crypto.PublicKey, ttl time.Duration, now time.Time, dnsNames []string, usage x509.ExtKeyUsage) ([]byte, error) {
+	var ips []net.IP
+	var names []string
+	// Callers naturally pass "127.0.0.1" alongside hostnames; putting an address in
+	// DNSNames silently produces a certificate that fails to verify for it, so they are
+	// sorted here rather than becoming a puzzle at handshake time.
+	for _, n := range dnsNames {
+		if ip := net.ParseIP(n); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		names = append(names, n)
+	}
+	return c.IssueLeaf(pub, LeafOptions{
+		NodeID: nodeID, TTL: ttl, DNSNames: names, IPAddresses: ips, Usage: usage,
+	}, now)
 }
 
 // NodeIDFromCert extracts the identity a peer certificate asserts.

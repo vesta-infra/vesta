@@ -106,3 +106,7 @@ func FindAndVerify(records []JoinToken, secret string, now time.Time) (JoinToken
 	}
 	return JoinToken{}, ErrTokenUnknown
 }
+
+// HashToken exposes the storage form of a join-token secret, so the enrollment path can
+// look a token up without the secret ever being written down.
+func HashToken(secret string) string { return hashToken(secret) }
