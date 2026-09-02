@@ -95,6 +95,13 @@ type Store interface {
 
 	Nodes() NodeRepo
 	JoinTokens() JoinTokenRepo
+	Settings() SettingsRepo
+}
+
+// SettingsRepo holds small pieces of control-plane state that have no structured home.
+type SettingsRepo interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, value string, now time.Time) error
 }
 
 type NodeRepo interface {

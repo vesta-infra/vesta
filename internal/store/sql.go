@@ -21,6 +21,7 @@ func (s *sqlStore) DB() *sql.DB      { return s.db }
 func (s *sqlStore) Migrate(ctx context.Context) error { return migrate(ctx, s.db, s.dialect) }
 func (s *sqlStore) Nodes() NodeRepo                   { return &nodeRepo{s} }
 func (s *sqlStore) JoinTokens() JoinTokenRepo         { return &tokenRepo{s} }
+func (s *sqlStore) Settings() SettingsRepo            { return &settingsRepo{s} }
 
 func (s *sqlStore) q(query string) string { return rebind(s.dialect, query) }
 
@@ -314,6 +315,35 @@ func (r *tokenRepo) Revoke(ctx context.Context, id string, now time.Time) error 
 		now.UnixNano(), id)
 	if err != nil {
 		return fmt.Errorf("store: revoke join token: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- settings
+
+type settingsRepo struct{ s *sqlStore }
+
+func (r *settingsRepo) Get(ctx context.Context, key string) (string, error) {
+	var v string
+	row := r.s.db.QueryRowContext(ctx, r.s.q(`SELECT value FROM settings WHERE key = ?`), key)
+	if err := row.Scan(&v); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: setting %q", ErrNotFound, key)
+		}
+		return "", fmt.Errorf("store: get setting: %w", err)
+	}
+	return v, nil
+}
+
+// Set is an upsert. The ON CONFLICT form is spelled identically by SQLite and Postgres,
+// which is why this needs no dialect branch.
+func (r *settingsRepo) Set(ctx context.Context, key, value string, now time.Time) error {
+	_, err := r.s.db.ExecContext(ctx, r.s.q(`INSERT INTO settings (key, value, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`),
+		key, value, now.UnixNano())
+	if err != nil {
+		return fmt.Errorf("store: set setting: %w", err)
 	}
 	return nil
 }

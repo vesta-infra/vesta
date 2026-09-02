@@ -43,10 +43,14 @@ func eachBackend(t *testing.T, fn func(t *testing.T, s Store)) {
 			if b.name == "postgres" {
 				// Each run starts from a clean schema so ordering between tests cannot
 				// matter. SQLite gets this for free by being in-memory per connection.
-				for _, tbl := range []string{"join_tokens", "nodes", "schema_migrations"} {
-					if _, err := s.(*sqlStore).db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl); err != nil {
-						t.Fatalf("reset %s: %v", tbl, err)
-					}
+				//
+				// The whole schema is dropped rather than a list of tables: a list has to
+				// be updated by every future migration, and forgetting leaves a stale
+				// table behind while schema_migrations is reset — which presents as
+				// "relation already exists" on a migration that is perfectly correct.
+				if _, err := s.(*sqlStore).db.ExecContext(ctx,
+					"DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
+					t.Fatalf("reset schema: %v", err)
 				}
 			}
 			if err := s.Migrate(ctx); err != nil {

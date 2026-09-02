@@ -18,11 +18,18 @@ LDFLAGS := -s -w \
 
 all: check build
 
-build: $(addprefix bin/,$(BINARIES))
-
-bin/%:
+# Deliberately a loop rather than file targets. A `bin/%` rule with no prerequisites is
+# never out of date, so make silently skips rebuilding after a source change — presenting
+# as an edit having no effect, which is a miserable thing to debug. Marking the outputs
+# .PHONY does not help either: make skips implicit-rule search for phony targets, so the
+# pattern stops matching at all. Go's build cache already makes a redundant invocation
+# nearly free, so let it decide what to rebuild.
+build:
 	@mkdir -p bin
-	go build -trimpath -ldflags '$(LDFLAGS)' -o $@ ./cmd/$*
+	@for b in $(BINARIES); do \
+		go build -trimpath -ldflags '$(LDFLAGS)' -o bin/$$b ./cmd/$$b || exit 1; \
+	done
+	@echo "built: $(BINARIES)"
 
 # Every store-touching test runs against both backends, on every commit rather than
 # nightly, so the less-used one cannot rot (ARCHITECTURE §2.5).
